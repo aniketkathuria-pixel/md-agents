@@ -1,0 +1,16 @@
+{
+  "max_comb_limit": 20000000,
+  "default_service_time_min": 120,
+  "default_max_hops": 4,
+  "default_threshold_a": 50,
+  "default_threshold_b": 150,
+  "default_depot_departure_min": 0,
+  "default_time_window_start_min": 0,
+  "default_time_window_end_min": 1440,
+  "local_zonal_distance_threshold_km": 200,
+  "col_location_name": "destination_hub_key",
+  "col_mh_assignment": "current_fc_mh",
+  "col_demand": "total_cft",
+  "col_top266_load": "top266_shipments",
+  "col_ml": "ML"
+}

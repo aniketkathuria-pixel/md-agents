@@ -1,0 +1,27 @@
+{
+  "default_cft_nfb": 3.5,
+  "default_cft_fbf": 7.0,
+  "plan_cft_fallback_alpha": 7.0,
+  "plan_cft_fallback_alite": 5.0,
+  "plan_cft_fallback_nfbf": 3.5,
+  "lm_fdp_exclude_logistics_carriers": ["3PL"],
+  "fail_on_resort_duplicate_mh1_lmhub": false,
+  "input_error_rate_warn": 0.2,
+  "input_error_rate_fail": null,
+  "fbf_plan_vendors": ["ekl"],
+  "fbf_plan_day_start": 1,
+  "fbf_plan_day_end": 30,
+  "fbf_plan_avg_divisor": 30,
+  "fbf_plan_missing_cft_fallback_cuft": 7.0,
+  "sd_returns_factor": 0.22,
+  "core_sc_to_fbf_band": {
+    "coreea": "SHA",
+    "washingmachinedryer": "5SC",
+    "refrigerator": "5SC",
+    "homeentertainmentlarge": "5SC",
+    "seasonalea": "SHA",
+    "premiumea": "SHA",
+    "airconditioner": "5SC",
+    "microwave": "5SC"
+  }
+}

@@ -1,0 +1,33 @@
+# Excel and binary data files
+*.xlsx
+*.xlsb
+*.xltx
+*.xlsm
+*.xls
+
+# CSV data files
+*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+*.ipynb
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output folders (large run outputs)
+Agent1_DataPrep/output/
+Agent3_Clustering/output/
+Agent4_Routing/output/
+
+# Temp / logs
+*.log
+*.tmp
