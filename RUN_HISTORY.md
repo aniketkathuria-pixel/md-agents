@@ -74,3 +74,140 @@ One entry per completed planning cycle. Claude appends automatically after each 
 ### Notes
 - build_sd_plan_aggregate called in path mode (not DataFrame mode) to avoid OOM on 42 GB NFBF file
 - No MH1 tagging file in Inputs — source_type/stream for NFBF lanes derived from SD plan only (MH vs PH distinction not applied)
+
+---
+
+## June'26 Full Pipeline Run — 2026-07-20
+
+### Inputs Used
+- Resort file: D S3 FRW June'26 Resort V4 CSV Tool OP.xlsb (carry-forward from Agent 1 run)
+- SD plan window: day_32 to day_61 (divisor=30, June)
+- Agent 3 output: Agent3_Clustering\output\run_20260716b\dh_fc_mh_assignment.csv (820 rows)
+- Phase 2 output: Agent3_Clustering\output\run_20260716b_phase2c\
+- Location file: Inputs\Location_File_final.xlsx (820 rows, 0 null ML after user fix)
+- Distance matrix: Inputs\Distance Matrix.csv
+- MHDH rate card: Inputs\MHDH_RateCard.xlsx (JLRSF1, KLM1 added by user this session)
+- DH Feasibility: Inputs\DH Feasibility.csv (12 null-ML rows fixed by user this session)
+- Lat Longs: Inputs\Lat Longs.xlsx
+
+### Agent 3 Results
+- DHs assigned: 820 total (132 moved by Agent 3, 688 unchanged)
+- Phase 2 candidates (build_phase2_candidates): 5 valid pairs
+- Savings table was regenerated this session — previous table had bug grouping by assigned_fc_mh instead of current_fc_mh, causing false pairs (e.g. VZG1→VGA1 had 0 flagged DHs)
+
+### Phase 2 Results
+- Pairs evaluated: VNS4→LKO3, VNS4→GOP1, PAT6→GOP1
+- Pairs accepted: VNS4→LKO3 (4 DHs, ₹1.91L/mo saving), VNS4→GOP1 (4 DHs, ₹4.29L/mo saving)
+- Pairs rejected: PAT6→GOP1
+- Net monthly savings from accepted changes: ₹6.20L/mo (8 DHs overridden in location file)
+- Phase 2 run: run_20260716b_phase2c
+
+### Agent 4 Results
+- MHs routed: 36 (AJLX and IXA3X skipped — missing MHDH rate card entries; 4 DHs excluded)
+- Total routes: 440 (milkrun + FTL combined)
+- OSRM calls: 9,755 (all distance gaps resolved via OSRM at runtime)
+- Total monthly cost: ₹10,34,09,227 (Rs 10.34 Cr/mo)
+- Status: ok (pipeline return status=ok)
+- Output folder: Agent4_Routing\output\run_20260716b
+
+### Per-MH Summary
+
+| MH | DHs | Milkrun | FTL | Missing | Cost (₹/mo) |
+|---|---|---|---|---|---|
+| BAG | 9 | 4 | 0 | 0 | 6,10,122 |
+| FPT | 30 | 15 | 2 | 0 | 33,04,182 |
+| FRN | 33 | 19 | 13 | 0 | 41,23,531 |
+| L_AGR2 | 12 | 8 | 0 | 0 | 13,73,688 |
+| L_AMD3 | 21 | 12 | 2 | 0 | 24,87,244 |
+| L_AURPRC1 | 6 | 4 | 0 | 0 | 6,15,122 |
+| L_BHB1 | 37 | 15 | 0 | 0 | 50,67,421 |
+| L_BHO1 | 6 | 3 | 0 | 0 | 5,23,606 |
+| L_CJB3 | 36 | 19 | 2 | 0 | 56,63,169 |
+| L_GOP1 | 5 | 4 | 0 | 0 | 4,68,906 |
+| L_HBL1 | 20 | 14 | 1 | 0 | 37,12,577 |
+| L_IDRL1 | 13 | 7 | 0 | 0 | 16,78,950 |
+| L_JAIX4 | 12 | 8 | 0 | 0 | 13,82,301 |
+| L_KLM1 | 5 | 3 | 0 | 0 | 4,13,146 |
+| L_KOL5 | 54 | 0 | 4 | 1 | 4,67,741 |
+| L_LKO3 | 32 | 20 | 0 | 0 | 44,79,467 |
+| L_MUMX | 30 | 19 | 7 | 0 | 45,35,247 |
+| L_NGP1 | 15 | 9 | 0 | 0 | 17,43,162 |
+| L_PAT6 | 65 | 0 | 2 | 1 | 2,32,317 |
+| L_PUNML1 | 10 | 7 | 1 | 0 | 8,94,684 |
+| L_RAI1 | 7 | 4 | 0 | 0 | 5,74,665 |
+| L_RJKPRC1 | 7 | 5 | 0 | 0 | 10,66,427 |
+| L_RNCSF1 | 23 | 11 | 0 | 0 | 34,47,094 |
+| L_SGR1 | 53 | 27 | 1 | 0 | 73,20,404 |
+| L_SIL1 | 13 | 7 | 2 | 0 | 13,88,260 |
+| L_SRTSFL1 | 6 | 2 | 0 | 0 | 4,44,560 |
+| L_VGA1 | 14 | 9 | 0 | 0 | 15,61,751 |
+| L_VNS4 | 17 | 10 | 0 | 0 | 16,70,782 |
+| L_VZG1 | 18 | 10 | 0 | 0 | 22,03,443 |
+| L_YKBX1 | 35 | 19 | 0 | 0 | 71,91,254 |
+| MPL1 | 63 | 40 | 9 | 0 | 1,09,16,648 |
+| PBI | 51 | 25 | 3 | 0 | 1,76,86,908 |
+| THV | 33 | 24 | 8 | 0 | 41,60,448 |
+
+### Notes
+- AJLX and IXA3X skipped per user instruction — MHDH rate card still missing for these 2 MHs; their DHs (ABA, BLO, LGI, LWT) excluded from this run
+- L_KOL5: ILP FAILED for milkrun cluster — SATELLITEHUB_KALIACHAK uncovered; 0 milkrun routes, 4 FTL only
+- L_PAT6: ILP FAILED for milkrun cluster — SATELLITEHUB_BIHTA uncovered; 0 milkrun routes, 2 FTL only (cost ₹2.32L is FTL-only, highly understated)
+- OSRM blocked on MNR→PITHORAGARH and GHAZIABAD→SHAMLID/ROORKEE/RUDRAPRAYAG (WinError 10013 firewall); haversine fallback used
+- 4 stale lat/long rows in Lat Longs.xlsx (REVX, AMD_FLEX, CJB_flex, LKO_FLex) cause preflight status=partial noise but do not affect routing
+- Phase 2 savings table bug discovered and documented this session — see PLAYBOOK.md for pattern
+
+---
+
+## June'26 Refresh Run (run_20260721) — 2026-07-21
+
+### Inputs Used
+- SD plan window: day_32 to day_61 (divisor=30, June; Day_1 = 1 May)
+- Alpha SD plan: JJA Alpha SD Plan (Day 1_1 May).csv
+- Alite SD plan: JJA_Alite SD Plan (Day 1_1 May).csv
+- NFBF SD plan: JJA_NFBF SD Plan (Day 1_1 May).csv
+- CFT vertical: CFT Vertical.csv
+- MH-DH mapping: mh_dh_mapping.csv
+- FBF master: Actuals FBF Master.xlsx, Plan fbf master.xlsx
+- FBF network pathway: Consolidated H2H June'26 Network - June'26 H2H.csv
+- Distance matrix: Inputs\Distance Matrix.csv
+- MHDH rate card: Inputs\MHDH_RateCard.xlsx
+- DH Feasibility: Inputs\DH Feasibility.csv
+- Lat Longs: Inputs\Lat Longs.xlsx
+- Run tag: run_20260721
+
+### Agent 1 Results
+- Pipeline A (plan_volume): ok — 206,106 rows
+- Pipeline C (fbf_plan_dh_aggregate): ok — 820 rows
+- Pipeline E (fbf_network_pathway_wide): partial — 38 rows (79 unmapped DCs expected)
+- Output: Agent1_DataPrep\output\run_20260721\
+
+### Agent 3 Results
+- DHs assigned: 820 total (552 speed-based D1%, 268 cost-based)
+- DHs moved from prior assignment: 132
+- OSRM auto-fetch: 254 missing distance pairs resolved at runtime
+- Top 3 Phase 2 candidates: VNS4→LKO3 (₹13.04L est), VNS4→GOP1 (₹6.25L est), PAT6→GOP1 (₹6.51L est)
+- Output: Agent3_Clustering\output\run_20260721\dh_fc_mh_assignment.csv
+
+### Phase 2 Results
+- Pairs evaluated: VNS4→LKO3, VNS4→GOP1, PAT6→GOP1 (top 3 from Agent 3)
+- ₹5L/month filter applied (ILP-confirmed actual savings)
+- Pairs accepted: VNS4→LKO3 — ₹8.07L/month (5 DHs: ALD, ALDNAINI, LALGANJAJHARA, PTG1, SLN)
+- Pairs rejected: VNS4→GOP1 (₹3.85L < ₹5L), PAT6→GOP1 (₹4.06L < ₹5L)
+- Net monthly saving: ₹8.07L/month
+- Three runtime monkey-patches applied to bridge agent3.py / agent3_phase2.py / agent4.py compatibility (see PLAYBOOK.md)
+
+### Agent 4 Results
+- Run scope: CENTRALHUB_L_PAT6 only (most DHs in network: 65)
+- Phase 2 changes applied to location file before Agent 4 (VNS4→LKO3 5 DHs overridden)
+- Routes: 31 milkrun + 2 FTL (DANAPUR 24ft, FKKNK 24ft) = 33 total
+- Missing DHs: 0 (all 65 covered)
+- Monthly cost: ₹1,07,81,103
+- Status: ok
+- Output: Agent4_Routing\output\run_20260721\
+
+### Notes
+- Agent 4 scoped to PAT6 only per user instruction ("run for only one MH, the one with most DHs")
+- First run had ILP failure (BIHTA uncovered) → user added BIHTA to Lat Longs.xlsx → rerun resolved all 65 DHs
+- OSRM timed out on several NAUGACHIA and SIWANSPLIT inter-hub pairs (firewall); haversine fallback used
+- Known pre-run blockers unchanged: AJLX, IXA3X missing rate card; JLRSF1, KLM1 rate card missing (pre-existing)
+- Preflight status=failed due to AJLX/IXA3X (known) and 11 DHs missing distance data — not blocking for PAT6 run

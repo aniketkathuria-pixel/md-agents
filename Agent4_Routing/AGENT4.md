@@ -486,6 +486,28 @@ All files written to `out_dir` by `run_agent4_pipeline`. Retrieved via `result["
 
 ---
 
+## OSRM Reporting — Mandatory
+
+After every Agent 4 run, report:
+- Total OSRM calls attempted
+- Calls succeeded / failed
+- If any failed: list the exact pairs (origin → destination)
+
+Never summarise as "some failed" — always give the exact count and pairs.
+
+Data source: `r['data']['n_osrm_calls']` (total attempted) and `r['data']['osrm_fallback_df']` (one row per OSRM-filled pair, columns: `origin`, `destination`, `distance_km`, `transit_minutes`). Also written to `osrm_fallback_log.csv` in the output directory.
+
+### Enriching Distance Matrix after OSRM fallbacks
+
+If `r['data']['osrm_fallback_df']` is non-empty:
+
+1. Show the user the pairs (`origin`, `destination`, `distance_km`)
+2. Ask: "Should I add these N pairs to Distance Matrix.csv?"
+3. On approval: read `Inputs\Distance Matrix.csv`, add a `source` column (existing rows = `original`, new rows = `osrm_fallback`), append the new pairs mapping `origin`→`S_Code` and `destination`→`D_Code`, deduplicate on (`S_Code`, `D_Code`) keeping existing rows, save back to `Inputs\Distance Matrix.csv`.
+4. Confirm how many rows were added.
+
+---
+
 ## 8. Issue Types Reference
 
 Every `result["issues"]` entry has shape `{"type": str, "detail": str}`.

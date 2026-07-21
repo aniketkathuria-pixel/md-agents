@@ -434,6 +434,28 @@ All 7 files are written to the `output_dir` passed to `run_agent3`. No timestamp
 
 ---
 
+## OSRM Reporting — Mandatory
+
+After every Agent 3 run, report:
+- Total OSRM calls attempted
+- Calls succeeded / failed
+- If any failed: list the exact pairs (origin → destination)
+
+Never summarise as "some failed" — always give the exact count and pairs.
+
+Data source: read `agent3_missing_distance_pairs.csv` (path in `r['data']['missing_pairs_csv']`). Columns: `from_hub_key`, `to_hub_key`, `reason`, `assumed_distance_km`, `assumed_cost_per_trip_rs`. Rows where `reason == "osrm_fallback"` are pairs OSRM filled successfully. Rows with other reasons (`missing_distance`, etc.) are pairs where OSRM also failed and no distance was used.
+
+### Enriching Distance Matrix after OSRM fallbacks
+
+If `agent3_missing_distance_pairs.csv` contains rows with `reason == "osrm_fallback"`:
+
+1. Show the user the pairs (`from_hub_key`, `to_hub_key`, `assumed_distance_km`)
+2. Ask: "Should I add these N pairs to Distance Matrix.csv?"
+3. On approval: read `Inputs\Distance Matrix.csv`, add a `source` column (existing rows = `original`, new rows = `osrm_fallback`), append the new pairs mapping `from_hub_key`→`S_Code` and `to_hub_key`→`D_Code`, deduplicate on (`S_Code`, `D_Code`) keeping existing rows, save back to `Inputs\Distance Matrix.csv`.
+4. Confirm how many rows were added.
+
+---
+
 ## 7. Issue Types Reference
 
 All public functions return `{"status": ..., "data": ..., "issues": [...]}`. `issues` is always a list; it may be empty even on `status: "ok"`. `status: "partial"` means the function completed but with degraded accuracy; `status: "failed"` means `data` is `None`.

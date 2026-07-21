@@ -2254,7 +2254,6 @@ def run_phase2(
         agent3_df = pd.read_csv(assign_csv, dtype=str)
 
         # H2H network (pre-loaded DataFrame)
-        h2h = load_h2h.__func__(h2h_df) if hasattr(load_h2h, "__func__") else load_h2h(h2h_df)
         # load_h2h in agent3_phase2 expects a Path; give it a temp file
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as _tmp_h2h:
             h2h_df.to_csv(_tmp_h2h, index=False)
@@ -2293,11 +2292,14 @@ def run_phase2(
                 pass
 
         # Load Agent 4 config + rate card (rate card requires temp file for p4.load_rate_card)
+        # Merge Agent 4 defaults over Agent 3 cfg so Agent 4 functions get their required keys
+        a4_cfg = p4.load_agent4_config() if hasattr(p4, "load_agent4_config") else {}
+        merged_cfg = {**a4_cfg, **cfg}
         with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as _tmp_rc:
             _tmp_rc_path = _tmp_rc.name
         try:
             mhdh_rate_card_df.to_excel(_tmp_rc_path, index=False, engine="openpyxl")
-            mh_configs = p4.load_rate_card(Path(_tmp_rc_path), cfg)
+            mh_configs = p4.load_rate_card(Path(_tmp_rc_path), merged_cfg)
         finally:
             os.unlink(_tmp_rc_path)
 
@@ -2393,7 +2395,7 @@ def run_phase2(
                 mh1=from_mh, mh2=to_mh,
                 dist_dict=dist_dict, latlong=latlong,
                 mh_configs=mh_configs, location_df=location_df,
-                cfg=cfg, residual_threshold=residual_threshold,
+                cfg=merged_cfg, residual_threshold=residual_threshold,
                 initial_assignment=a3_assign,
                 on_progress=_prog,
                 mhmh_monthly_mh1=mhmh_monthly_mh1,
@@ -2404,9 +2406,9 @@ def run_phase2(
             from_before = [d for d in pool if before_assign.get(d, from_mh) == from_mh]
             to_before = [d for d in pool if before_assign.get(d, from_mh) == to_mh]
             bfr = _run_a4_subset(from_mh, from_before, dist_dict, latlong,
-                                 mh_configs, location_df, cfg, residual_threshold)
+                                 mh_configs, location_df, merged_cfg, residual_threshold)
             btr = _run_a4_subset(to_mh, to_before, dist_dict, latlong,
-                                 mh_configs, location_df, cfg, residual_threshold)
+                                 mh_configs, location_df, merged_cfg, residual_threshold)
             afr, atr = best_afr, best_atr
 
             pool_cost_before = bfr.total_monthly_cost + btr.total_monthly_cost
@@ -2421,7 +2423,7 @@ def run_phase2(
                 pool_dhs=pool, best_assignment=best,
                 agent3_df=agent3_df, location_df=location_df,
                 h2h_df=h2h, dist_dict=dist_dict,
-                mh_configs=mh_configs, cfg=cfg,
+                mh_configs=mh_configs, cfg=merged_cfg,
                 before_from_result=bfr, before_to_result=btr,
                 after_from_result=afr, after_to_result=atr,
                 mhmh_cache=mhmh_cache if mhmh_cache else None,
