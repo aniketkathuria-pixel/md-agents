@@ -208,8 +208,11 @@ def build_freeze_day_location_file(
 
     top266_col = cfg.get("col_top266_load", "top266_shipments")
     mh_col = cfg.get("col_mh_assignment", "current_fc_mh")
+    low_priority_threshold = float(cfg.get("low_priority_top266_threshold", 10))
     allowed_positions_list = []
     freq_allowed_list = []
+    d1_true_threshold_list = []
+    time_window_end_list = []
     for _, row in df.iterrows():
         t266 = row.get(top266_col, 0)
         t266 = float(t266) if pd.notna(t266) else 0.0
@@ -220,8 +223,27 @@ def build_freeze_day_location_file(
             th_a, th_b = cfg["default_threshold_a"], cfg["default_threshold_b"]
         allowed_positions_list.append(a4.derive_allowed_positions(t266, th_a, th_b))
         freq_allowed_list.append(a4.derive_freq_allowed(t266))
+
+        # Rollover: base_time_window_end is whatever build_location_file already
+        # set (respects any time_window_overrides; defaults to the hardcoded
+        # 1800 in agent4.py -- NOT the stale/unused default_time_window_end_min
+        # config key, see agent4_config.json note). d1_true_threshold is this
+        # base value, UNRELAXED -- used only to measure true D1% success.
+        # time_window_end is the FEASIBILITY window fed to route generation;
+        # for low-Top266 DHs it's relaxed by +1 day, allowing a later route
+        # TMS (better speed for the higher-priority DHs on the same route) at
+        # the cost of this DH's own D1% for that day (it rolls to D+2).
+        base_end = float(row["time_window_end"])
+        d1_true_threshold_list.append(base_end)
+        if t266 < low_priority_threshold:
+            time_window_end_list.append(base_end + 1440.0)
+        else:
+            time_window_end_list.append(base_end)
+
     df["allowed_positions"] = allowed_positions_list
     df["Freq_Allowed"] = freq_allowed_list
+    df["d1_true_threshold"] = d1_true_threshold_list
+    df["time_window_end"] = time_window_end_list
 
     status = "partial" if issues else "ok"
     return {"status": status, "data": df, "issues": issues}

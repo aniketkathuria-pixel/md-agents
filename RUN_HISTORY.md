@@ -252,3 +252,40 @@ One entry per completed planning cycle. Claude appends automatically after each 
 - Several ad-hoc routes flagged "Consider as standing backup route" (recur ≥7 times/month), e.g. `CENTRALHUB_L_PAT6 → SATELLITEHUB_TAMKUHIRAJ → CENTRALHUB_L_PAT6` (9 uses, ₹74,809 total) — candidates for promotion to a standing route.
 - Full internal progress logging (per-MH, per-freeze-day-candidate, per-truck-upgrade-iteration) added this cycle via an `on_progress` callback, matching legacy `agent4.py`'s convention — verified streaming correctly to a background task log.
 - The peak-day-should-be-0%-adhoc question that surfaced the third bug is a good general sanity check to re-run after any future change to the spillover/FTL logic — verify `compute_spillover_day` on the max-demand synthetic day shows zero spillover before trusting a run's numbers.
+
+---
+
+## Agent 4 Dock Scheduling + CX-Cutoff + Speed Engine — First Real-Data Test (PAT6 + FPT) — 2026-07-23
+
+### Inputs Used
+- Agent 1 output: `run_freeze_day_test_20260722` (`dh_daywise_volume.csv`, day window day_32–day_61)
+- Agent 3 output: `run_20260716b\dh_fc_mh_assignment.csv`, filtered to CENTRALHUB_L_PAT6 + CENTRALHUB_FPT
+- H2H: Consolidated H2H June'26 Network - June'26 H2H.csv
+- Distance matrix: Inputs\Distance Matrix.csv
+- MHDH rate card: Inputs\MHDH_RateCard.xlsx — first run to use its new `Docks` column (PAT6=30, FPT=15)
+- DH Feasibility: Inputs\DH Feasibility.csv
+- Lat Longs: Inputs\Lat Longs.xlsx
+- **New:** Load Profile.csv — first run where this becomes a required Agent 4 input (CX-cutoff capture-fraction lookup via `a3.build_load_profile_interp`)
+- Scope: CENTRALHUB_L_PAT6 (65 DHs) + CENTRALHUB_FPT (30 DHs) only
+
+### Agent 3 Results
+- Carried forward unchanged from prior assignment (no re-run this cycle)
+
+### Phase 2 Results
+- Not run this cycle
+
+### Agent 4 Results (freeze-day engine + new `agent4_dock_scheduling.py`)
+- Full freeze-day search rerun for both MHs (required — the new rollover mechanism changes route feasibility, which can shift the optimal candidate day) followed by dock scheduling as a separate post-processing step (`run_dock_scheduling_for_all_mhs`), per the documented call pattern.
+
+| MH | DHs | Optimal day | Adhoc% | Total/mo | Baseline/mo | Savings/mo | Docks (total/committed) | Routes | Speed% |
+|---|---|---|---|---|---|---|---|---|---|
+| CENTRALHUB_L_PAT6 | 65 | D67 (synthetic) | 9.3% | ₹1,24,02,461 | ₹1,49,26,163 | ₹25,23,702 (~16.9%) | 30 / 28 | 36 | 72.8% |
+| CENTRALHUB_FPT | 30 | D60 (real day) | 8.6% | ₹37,81,737 | ₹41,32,442 | ₹3,50,705 (~8.5%) | 15 / 14 | 19 | 75.5% |
+
+- Status: ok (both the freeze-day pipeline and dock scheduling; no ILP cluster failures, no `dock_schedule_infeasible`)
+- Output folder: `Agent4_Routing\output\run_dock_sched_20260723\`
+
+### Notes
+- Optimal freeze days moved vs. the pre-rollover test run (PAT6: D47→D67, FPT: D33→D60) — expected, caused by the rollover mechanism relaxing feasibility windows for low-Top266 DHs (`top266_shipments < 10`), not a bug. See PLAYBOOK.md.
+- Only 1 of 55 total routes across both MHs needed a dock-forced departure shift away from its unconstrained-ideal TMS (PAT6 Route 30, preponed 180 min, speed dropped to 35.3% on that route) — dock contention is rare at current dock counts.
+- Weighted Actual D1%/speed (genuine post-routing metric, distinct from Agent 3's predictive D1%): PAT6 72.8%, FPT 75.5%.

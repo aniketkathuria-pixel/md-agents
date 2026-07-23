@@ -22,5 +22,16 @@
   "zero_day_threshold": 5,
   "col_h2h_dh_key": "Dest",
   "col_h2h_mr_number": "MR Number",
-  "col_h2h_frequency": "frequency Final"
+  "col_h2h_frequency": "frequency Final",
+  "d1_true_threshold_min": 1800,
+  "low_priority_top266_threshold": 10,
+  "default_n_docks": 5,
+  "dock_productivity_per_hour": 100,
+  "dock_transition_buffer_min": 30,
+  "adhoc_dock_reserve_pct": 0.05,
+  "cx_cutoff_multi_dh_hours": 3,
+  "cx_cutoff_single_dh_hours": 2,
+  "cx_cutoff_processing_hours": 1,
+  "dock_time_granularity_min": 10,
+  "dock_search_window_hours": 18
 }

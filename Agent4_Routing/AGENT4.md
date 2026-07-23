@@ -504,6 +504,30 @@ A separate, additive engine sitting alongside the legacy `run_agent4_pipeline` a
 
 ---
 
+## 7b. Dock Scheduling + CX-Cutoff + Speed Engine (`agent4_dock_scheduling.py`)
+
+A third additive module (alongside `agent4.py` and `agent4_freeze_day.py`), run as a **separate post-processing step after** `run_agent4_freeze_day_pipeline` — same pattern as `write_route_visualizer` (not called from inside the pipeline, to avoid a circular import: this module imports `agent4_freeze_day` for `_compute_shifted_mh_dep`/`_attr_from_dh_rows`).
+
+**What it does:** for the optimal freeze-day candidate's route plan (never all 37 candidates — dock scheduling only changes departure timing, never cost, so it can't affect which day is optimal), decides each route's *actual* dock-feasible departure time (TMS) given a limited number of physical docks per MH, and computes a genuine "Actual D1%"/speed metric — distinct from Agent 3's predictive D1% (which assumes direct MH-DH transit with no route/dock constraints and covers shipments still in transit to the MH; this one measures what actually happens given real routes and real dock contention).
+
+**Two distinct time concepts:**
+- **Dock occupancy** — a dock is physically blocked from `TMS - (shipments_on_route / dock_productivity_per_hour)` to `TMS + dock_transition_buffer_min`. Volume/productivity-based, unrelated to the CX-cutoff buffer below.
+- **CX (customer order) cutoff** — `TMS - (cx_cutoff_multi_dh_hours or cx_cutoff_single_dh_hours) - cx_cutoff_processing_hours`. Looked up against `Load Profile.csv`'s cumulative order-placement fraction (reusing `agent3.build_load_profile_interp` directly — not re-implemented) to determine what fraction of a DH's daily Top266 volume is actually captured onto that truck. This is *why* a later TMS is better: it captures more of the day's late-placed orders.
+
+**The objective is a weighted trade-off (an ILP), not strict priority preservation**: `maximize Σ top266_shipments × capture_fraction`, summed over DHs whose arrival also clears the **true** D1% threshold (`d1_true_threshold`, always 1800 — never the rollover-relaxed feasibility window). A higher-priority route can still be nudged if the aggregate benefit is large enough; see `low_priority_top266_threshold`/rollover mechanism below for the companion piece that widens *feasibility* for low-priority DHs.
+
+**Day-boundary handling (important, found via testing):** the CX-cutoff hour-of-day is **clamped, not wrapped**, on both sides — `>= 1440` (a full day-0 cycle has elapsed) → treated as 100% capture; `< 0` (preponed before the reference start) → treated as ~0% capture (too early, nothing placed yet). A naive `% 1440` modulo creates a mirror-image artifact on *both* sides: wrapping a late departure into "start of a fresh cycle" (artificially near-zero) or wrapping an over-preponed departure into "late previous cycle" (artificially near-100%, which nearly caused a real regression during testing — see PLAYBOOK.md).
+
+**Config:** `dock_productivity_per_hour` (100), `dock_transition_buffer_min` (30), `adhoc_dock_reserve_pct` (0.05 — this fraction of a MH's docks is set aside for ad-hoc trucks so they're never modeled in the committed-route ILP), `low_priority_top266_threshold` (10), `cx_cutoff_multi_dh_hours` (3), `cx_cutoff_single_dh_hours` (2), `cx_cutoff_processing_hours` (1), `dock_time_granularity_min` (10, discretization for the ILP's candidate departure times), `dock_search_window_hours` (18, a computational bound only — not a business floor; there is deliberately no minimum-departure-time constraint). `MHConfig.n_docks` comes from `MHDH_RateCard.xlsx`'s `Docks` column.
+
+**Rollover mechanism (companion piece, lives in `agent4_freeze_day.build_freeze_day_location_file`):** a DH with `top266_shipments < low_priority_top266_threshold` gets its *feasibility* window (`time_window_end`) relaxed by +1 day (e.g. 1800 → 3240), allowing routes to be generated with a much later TMS than that DH's true deadline would otherwise permit — trading that DH's own D1% (it explicitly rolls to D+2) for better speed on the higher-priority DHs sharing its route. `d1_true_threshold` (always the unrelaxed 1800) is tracked separately and used only for speed measurement, never for feasibility.
+
+**Outputs** (written to the same `out_dir` as the freeze-day pipeline): `Dock_Schedule.csv` (per-route TMS + internal Placement_Time), `Route_Speed.csv` (per-route CX cutoff, capture fraction, speed%), `DH_Speed.csv` (per-DH arrival, true-threshold pass/fail, weighted contribution), `Speed_Summary.csv` (per-MH: docks total/committed, route count, weighted speed%).
+
+**Failure reporting**: if no dock-feasible schedule exists for an MH even preponed to the search-window bound, this returns `status="failed"` with an explicit `dock_schedule_infeasible` issue — never silently forces an infeasible schedule. Same "never hide a failure" principle as the ILP coverage-failure rule below.
+
+---
+
 ## OSRM Reporting — Mandatory
 
 After every Agent 4 run, report:
@@ -523,6 +547,28 @@ If `r['data']['osrm_fallback_df']` is non-empty:
 2. Ask: "Should I add these N pairs to Distance Matrix.csv?"
 3. On approval: read `Inputs\Distance Matrix.csv`, add a `source` column (existing rows = `original`, new rows = `osrm_fallback`), append the new pairs mapping `origin`→`S_Code` and `destination`→`D_Code`, deduplicate on (`S_Code`, `D_Code`) keeping existing rows, save back to `Inputs\Distance Matrix.csv`.
 4. Confirm how many rows were added.
+
+---
+
+## ILP Failure Reporting — Mandatory
+
+**Never report a cost number for an MH where any bearing cluster's ILP failed.** A failed cluster means every DH in that cluster is uncovered — the reported cost for that MH is silently missing that entire cluster's milkrun cost, not just "slightly off." `status="ok"` at the pipeline level does **not** mean every MH's cost is complete — it only reflects that the run finished without a hard error.
+
+**Detection — check after every run, per MH, before trusting its cost:**
+- `Agent4MHResult.ilp_status` — dict of `cluster_id → "SUCCESS" | "FAILED"`. Any `"FAILED"` value means that cluster's cost is missing.
+- `Agent4MHResult.missing_dhs` — non-empty means those DHs have zero routes and zero cost attributed to them.
+- `validation_report_agent4.txt` / `on_progress` log lines — look for `WARN: ILP FAILED for cluster X; uncovered: [...]`.
+- **Freeze-day engine (`agent4_freeze_day.py`):** `run_freeze_day_candidate` calls the same underlying `run_agent4_for_mh` per candidate day, so `ilp_status`/`missing_dhs` are available on `mh_result` for **every candidate**, not just the optimal one. Check all of them, not only the day that gets selected as optimal — a structural failure (bad distance data, an impossible time window) depends only on distance/time-window/position constraints, none of which vary by simulated day, so it will normally repeat identically across every real and synthetic candidate for that MH. If a DH is uncovered on one candidate, expect it uncovered on all of them.
+
+**What to report instead of a cost number:**
+> "Computation FAILED for [MH name] — cluster [id] could not be covered. Uncovered DH(s): [list]. Reported cost for this MH is INCOMPLETE and should not be used."
+
+Then give the likely root cause and fix, using this checklist (in order of likelihood):
+1. **Missing lat/long** — DH absent from `Lat Longs.xlsx` → bearing defaults to 0° (due north placeholder) → no valid permutations. This is the most common cause (see PLAYBOOK.md "ILP cluster failure — DH missing from Lat Longs.xlsx"). Diagnose: check if every uncovered DH is present in `Lat Longs.xlsx`'s `Site_name` column.
+2. **Missing distance data** — a required MH↔DH or DH↔DH leg absent from the distance matrix and OSRM also failed/unavailable. Diagnose: check `dist_dict` for the uncovered DH's pairs; check `osrm_fallback_log.csv`/OSRM reporting section above for failures involving that DH.
+3. **Genuinely infeasible time window** — the DH is far enough from its MH that even a direct single-stop route (`transit_time(distance) + service_time`) would arrive after `time_window_end` for every possible position, no matter the route composition. Diagnose: manually compute `depot_departure + get_transit_time(dist_to_dh)` and compare against that DH's `time_window_end`. Fix options: widen the DH's time window (if the SLA data supports it), reduce its `depot_departure`, or reassign it to a nearer MH (an Agent 3 question, not an Agent 4 one).
+
+**Never** paper over this by reporting the MH's cost as-is with a footnote — the failure must be the headline of that MH's result, not a side note after a wrong number.
 
 ---
 

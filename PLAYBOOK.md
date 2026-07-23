@@ -37,6 +37,15 @@ Date: [YYYY-MM-DD]
 **Agents involved:** Agent 3 Phase 2
 **Date:** 2026-07-15
 
+### MANDATORY — Never report a cost number for an MH where ILP failed for any cluster
+**Rule:** `status="ok"` at the pipeline level does not mean every MH's cost is complete — it only means the run finished without a hard error. If `Agent4MHResult.ilp_status` shows `"FAILED"` for any cluster, or `missing_dhs` is non-empty, that MH's reported cost is silently missing an entire cluster's worth of milkrun cost. This must be the headline of that MH's result ("Computation FAILED for [MH] — cluster [id] uncovered, DHs: [list], cost is INCOMPLETE"), never a footnote after presenting a number.
+**Root-cause checklist to give alongside the failure** (in order of likelihood): (1) DH missing from `Lat Longs.xlsx` → bearing defaults to 0° → no valid permutations (see the specific pattern below); (2) missing distance data for a required leg, OSRM also failed; (3) genuinely infeasible time window — the DH is too far from its MH for any route composition to arrive before `time_window_end` (check `depot_departure + get_transit_time(dist)` against `time_window_end` directly).
+**Freeze-day engine note:** `run_freeze_day_candidate` (`agent4_freeze_day.py`) calls the same `run_agent4_for_mh` per candidate day, so `ilp_status`/`missing_dhs` are available per candidate, not just the optimal one. Since time-window/distance/position constraints don't vary by simulated day, a structural failure will typically repeat identically across every real and synthetic candidate for that MH — check more than just the winning day.
+**Agents involved:** Agent 4 (both legacy and freeze-day engine)
+**Date:** 2026-07-23
+
+---
+
 ### ILP cluster failure — DH missing from Lat Longs.xlsx → incomplete output
 **Problem:** `run_agent4_pipeline` logs `WARN: ILP FAILED for cluster X; uncovered: ['DH_NAME']` and `Step 4 ILP done: 0 routes assigned` for an MH. The result is **incomplete output** — not just for the named DH, but for every milkrun DH in that MH. None of them get a route. This is not a partial result; it is a silent gap in the plan. The pipeline returns `status="ok"` and reports a cost figure, but that cost is FTL-only and dramatically understated.
 
@@ -437,3 +446,36 @@ fd.write_route_visualizer(pipeline_res["data"]["per_mh_results"], latlong, out_d
 ### PAT6 + FPT test run — 2026-07-23 (see RUN_HISTORY.md for full detail)
 
 First real-data validation, on top of the June'26 Agent 1/Agent 3 outputs (`run_freeze_day_test_20260722`). Caught and fixed two real bugs (day-column-numbering collision, freq-2 spillover reversion missing) — see "Known patterns" above. Final corrected result: PAT6 optimal=D65 (synthetic), 8.7% adhoc, ₹20.17L/mo savings vs. baseline; FPT optimal=D54 (real day), 31.3% adhoc, ₹4.48L/mo savings vs. baseline.
+
+---
+
+## Dock Scheduling + CX-Cutoff + Speed Engine — first real-data run (PAT6 + FPT)
+
+**Problem:** After building `agent4_dock_scheduling.py` (dock ILP, CX-cutoff capture-fraction, Actual D1%/speed metric — see AGENT4.md §7b) against synthetic conflict scenarios only, needed to confirm it runs cleanly end-to-end on real production data and produces sane numbers.
+
+**Setup:** Reran the full freeze-day pipeline (not just dock scheduling) for CENTRALHUB_L_PAT6 (65 DHs, 30 docks) and CENTRALHUB_FPT (30 DHs, 15 docks) from `MHDH_RateCard.xlsx`'s `Docks` column, using the same `run_freeze_day_test_20260722` Agent 1/Agent 3 base data plus `Inputs\Load Profile.csv` (reused via `a3.build_load_profile_interp`, not re-implemented). A rerun of the full freeze-day search was required (not just the dock step) because the rollover mechanism changes `time_window_end` feasibility, which can change which candidate day is optimal.
+
+**Result — freeze-day optimum (with rollover mechanism live for the first time on real data):**
+
+| MH | Optimal day | Adhoc% | Total/mo | Baseline/mo | Savings/mo |
+|---|---|---|---|---|---|
+| CENTRALHUB_L_PAT6 | D67 (synthetic) | 9.3% | ₹1,24,02,461 | ₹1,49,26,163 | ₹25,23,702 (~16.9%) |
+| CENTRALHUB_FPT | D60 (real day) | 8.6% | ₹37,81,737 | ₹41,32,442 | ₹3,50,705 (~8.5%) |
+
+Both figures differ from the pre-rollover PAT6/FPT test run above (PAT6 was D47/real-day/9.2%/₹1.26Cr; FPT was D33/real-day/8.6%/₹37.7L) — this is an **expected consequence of adding the rollover mechanism**, not a regression: relaxing the feasibility window for low-Top266 DHs (`top266_shipments < low_priority_top266_threshold`, default 10) changes which routes are generable for some candidate days, which can shift the optimum. Always expect freeze-day comparison numbers to move whenever the rollover threshold config changes, even with identical demand data.
+
+**Result — dock scheduling + speed:**
+
+| MH | Docks total | Docks committed (95% after adhoc reserve) | Routes | Weighted Actual D1% (speed) |
+|---|---|---|---|---|
+| CENTRALHUB_L_PAT6 | 30 | 28 | 36 | 72.8% |
+| CENTRALHUB_FPT | 15 | 14 | 19 | 75.5% |
+
+Of 55 total routes across both MHs, only **1** needed a dock-forced TMS shift away from its dock-unconstrained ideal departure (PAT6 Route 30: preponed 180 min, dropping that route's own speed contribution to 35.3%) — confirms dock contention is genuinely rare at these MHs' current dock counts (28–30 committed docks against 36 routes), and the ILP only intervenes when it actually has to.
+
+**No failures:** `ilp_status` clean (no `FAILED` clusters) across all 37×2 freeze-day candidates, and `schedule_docks_and_compute_speed` returned `status="ok"` for both MHs (no `dock_schedule_infeasible`).
+
+**Outputs:** `Agent4_Routing\output\run_dock_sched_20260723\` — full freeze-day pipeline outputs plus `Dock_Schedule.csv`, `Route_Speed.csv`, `DH_Speed.csv`, `Speed_Summary.csv`.
+
+**Agents involved:** Agent 4 (freeze-day engine + dock-scheduling module)
+**Date:** 2026-07-23

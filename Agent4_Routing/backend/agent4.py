@@ -161,6 +161,7 @@ class MHConfig:
     city: str = ""
     tag: str = ""
     min_vehicle_ft: float = 6.5   # floor enforced before rate lookup; Phase 2 sets 20.0
+    n_docks: int = 5              # from MHDH_RateCard's Docks column; dock-scheduling only (agent4_dock_scheduling.py)
 
 
 def load_rate_card(path: Path, cfg: dict[str, Any]) -> dict[str, MHConfig]:
@@ -198,6 +199,7 @@ def load_rate_card(path: Path, cfg: dict[str, Any]) -> dict[str, MHConfig]:
         threshold_a  = float(row["threshold_a"]) if "threshold_a"  in df.columns and pd.notna(row.get("threshold_a"))  else cfg["default_threshold_a"]
         threshold_b  = float(row["threshold_b"]) if "threshold_b"  in df.columns and pd.notna(row.get("threshold_b"))  else cfg["default_threshold_b"]
         service_time = int(row["service_time"])  if "service_time" in df.columns and pd.notna(row.get("service_time")) else cfg["default_service_time_min"]
+        n_docks      = int(row["Docks"])          if "Docks"        in df.columns and pd.notna(row.get("Docks"))        else int(cfg.get("default_n_docks", 5))
 
         mh_configs[mh] = MHConfig(
             mh_name=mh,
@@ -209,6 +211,7 @@ def load_rate_card(path: Path, cfg: dict[str, Any]) -> dict[str, MHConfig]:
             service_time_min=service_time,
             city=str(row.get("City", "")).strip(),
             tag=str(row.get("Tag",  "")).strip(),
+            n_docks=n_docks,
         )
 
     return mh_configs
