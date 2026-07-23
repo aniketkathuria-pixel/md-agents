@@ -47,10 +47,10 @@ Flipkart's inventory is split into four distinct streams, each with different ha
 | FBF | Flipkart Basic Fulfilment | Standard Flipkart-sold and -fulfilled orders; highest volume | FC, FC_MH | FC → (SMH) → MH → MH → DH. Has two pathway sub-types: P1 (inventory sorted at origin FC before dispatch) and P2 (sorted at destination MH). P1 arrives earlier at MH. | Agent 1 (actuals), Agent 3 (cost model) |
 | NFBF | Non-FBF | Seller-fulfilled or marketplace items that use Flipkart network but are not Flipkart-warehoused | FC, SMH | Similar MH→MH→DH trunk path but different CFT profile (larger/bulkier items on average) and separate cost treatment in planning | Agent 1 (actuals), Agent 3 |
 | ALITE | Alite | Lightweight, small-parcel stream handled through Alite hubs; expedited routing | ALITE | ALITE → MH → DH. The ALITE→MH leg is not charged in the MH→MH cost model (source type exemption) | Agent 1 (actuals), Agent 3 |
-| MFC | Multi-FC | Shipments that consolidate across multiple FCs before trunk dispatch | FC | FC → MH → MH → DH. Similar to FBF but originates from multi-FC consolidation nodes | Agent 1 (actuals) |
+| MFC | Mini FC | Small FC opened adjacent to a DH to give faster delivery to the customer; dispatches shipments directly to nearby DHs, bypassing normal trunk hops | FC (mini) | FC → DH (direct) or short FC → MH → DH. Serves proximate DHs with reduced transit time. | Agent 1 (actuals) |
 
 **Why streams matter for the agents:**
-FBF and NFBF have different CFT (cubic feet per shipment) profiles — NFBF items tend to be bulkier, which changes truck utilisation and trip count calculations. FBF has P1/P2 pathway fractions that affect D1% SLA (P1 inventory is available at the MH earlier, allowing earlier truck departure). In Agent 3, FBF and NFBF are costed separately on the MH→MH leg; ALITE and PH source types receive a zero-cost exemption on that leg because their first trunk hop is not charged to the linehaul plan.
+FBF and NFBF have different CFT (cubic feet per shipment) profiles — FBF items tend to be bulkier, which changes truck utilisation and trip count calculations. FBF has P1/P2 pathway fractions that affect D1% SLA (P1 inventory is available at the MH earlier, allowing earlier truck departure). In Agent 3, FBF and NFBF are costed separately on the MH→MH leg; ALITE and PH source types receive a zero-cost exemption on that leg because their first trunk hop is not charged to the linehaul plan.
 
 ---
 
@@ -78,26 +78,26 @@ The milkrun leg is the local distribution move from a Mother Hub (or FC_MH) to a
 
 ## 5. Key Planning Files
 
-| File Name | What It Represents | Which Agent Reads It | Update Frequency |
-|---|---|---|---|
-| resort file | Shipment-level actuals with source hub, destination DH, pathway, stream, CFT. The ground-truth record of what moved and through which path. | Agent 1 | Daily |
-| plan_volume | Planned (forecast) shipment volumes by lane, stream, and pathway. Used when actuals are not yet available. | Agent 1 | Weekly/cycle |
-| LM FDP actuals | Last-mile First-Dispatch-Point actuals — records of when trucks actually left MHs. Used for D1% verification. | Agent 1 | Daily |
-| FBF day plan | Daily FBF volume plan by origin FC and destination DH. Used by Agent 1 for forward-looking volume. | Agent 1 | Daily |
-| SD plans (Alpha/Alite/NFBF) | Same-day dispatch plans for Alpha (expedited), Alite, and NFBF streams. Separate from FBF day plan. | Agent 1 | Daily |
-| FBF network pathway | Maps each FC→DH pair to the MH routing path (which MHs the shipment transits). Defines P1/P2 split. | Agent 1 | Monthly |
-| CFT vertical | CFT (cubic feet) lookup by product vertical/category. Used to convert shipment counts to volume. | Agent 1 | Quarterly |
-| MH1 tagging | Maps each DH to its primary serving MH (MH1). Used by Agent 1 and Agent 3 as the baseline assignment. | Agent 1, Agent 3 | Monthly |
-| LM PBH | Last-mile Plan-vs-Baseline-vs-Historical file. Provides shipment count benchmarks by DH. | Agent 1 | Weekly |
-| FM PBH | First-mile PBH equivalent for FC→MH inbound lanes. | Agent 1 | Weekly |
-| FC map | Maps FCs to their associated MHs and SMHs. Used to resolve pathway chains. | Agent 1 | Monthly |
-| Distance Matrix | Road or straight-line distances (km) between all MH↔DH pairs. Used by Agent 3 (assignment) and Agent 4 (routing). | Agent 2, Agent 4 | Quarterly |
-| MH1-MH2 rate card | Cost per trip (Rs/trip) for every active MH→MH trunk lane. Used to calculate trunk leg cost. | Agent 3 | Monthly |
-| MHDH rate card | Rs/km rate (local and zonal) for MH→DH milkrun legs, by MH. Used to calculate milkrun cost. | Agent 3, Agent 4 | Monthly |
-| DH Feasibility | Per-DH operating parameters: maximum load (ML) in tonnes, DH type (SATELLITEHUB etc.), active/inactive flag. Used by Agent 4 for FTL pre-processing and vehicle sizing. | Agent 4 | Monthly |
-| Lat Longs | Latitude/longitude coordinates for every MH and DH. Used by Agent 4 to build the location file for OSRM distance lookups. | Agent 4 | Quarterly |
-| Load Profile | Time-of-day distribution of order placement and dispatch readiness by DH. Used by Agent 4 to determine truck departure time for D1% calculation. | Agent 4 | Monthly |
-| H2H network file | Hub-to-Hub network topology defining MR-group memberships. Used by Phase 2 to expand the DH pool for contested MH pairs. Not read by Agent 3's main pipeline. | Agent 3 Phase 2 only | Monthly |
+| File Name | What It Represents | Which Agent Reads It |
+|---|---|---|
+| resort file | Shipment-level actuals with source hub, destination DH, pathway, stream, CFT. The ground-truth record of what moved and through which path. | Agent 1 |
+| plan_volume | Planned (forecast) shipment volumes by lane, stream, and pathway. Used when actuals are not yet available. | Agent 1 |
+| LM FDP actuals | Last-mile First-Dispatch-Point actuals — records of when trucks actually left MHs. Used for D1% verification. | Agent 1 |
+| FBF day plan | Daily FBF volume plan by origin FC and destination DH. Used by Agent 1 for forward-looking volume. | Agent 1 |
+| SD plans (Alpha/Alite/NFBF) | Same-day dispatch plans for Alpha (expedited), Alite, and NFBF streams. Separate from FBF day plan. | Agent 1 |
+| FBF network pathway | Maps each FC→DH pair to the MH routing path (which MHs the shipment transits). Defines P1/P2 split. | Agent 1 |
+| CFT vertical | CFT (cubic feet) lookup by product vertical/category. Used to convert shipment counts to volume. | Agent 1 |
+| MH1 tagging | Maps each DH to its primary serving MH (MH1). Used by Agent 1 and Agent 3 as the baseline assignment. | Agent 1, Agent 3 |
+| LM PBH | Last-mile Plan-vs-Baseline-vs-Historical file. Provides shipment count benchmarks by DH. | Agent 1 |
+| FM PBH | First-mile PBH equivalent for FC→MH inbound lanes. | Agent 1 |
+| FC map | Maps FCs to their associated MHs and SMHs. Used to resolve pathway chains. | Agent 1 |
+| Distance Matrix | Road or straight-line distances (km) between all MH↔DH pairs. Used by Agent 3 (assignment) and Agent 4 (routing). | Agent 2, Agent 4 |
+| MH1-MH2 rate card | Cost per trip (Rs/trip) for every active MH→MH trunk lane. Used to calculate trunk leg cost. | Agent 3 |
+| MHDH rate card | Rs/km rate (local and zonal) for MH→DH milkrun legs, by MH. Used to calculate milkrun cost. | Agent 3, Agent 4 |
+| DH Feasibility | Per-DH operating parameters: maximum load (ML) in tonnes, DH type (SATELLITEHUB etc.), active/inactive flag. Used by Agent 4 for FTL pre-processing and vehicle sizing. | Agent 4 |
+| Lat Longs | Latitude/longitude coordinates for every MH and DH. Used by Agent 4 to build the location file for OSRM distance lookups. | Agent 4 |
+| Load Profile | Time-of-day distribution of order placement and dispatch readiness by DH. Used by Agent 4 to determine truck departure time for D1% calculation. | Agent 4 |
+| H2H network file | Hub-to-Hub network topology defining MR-group memberships. Used by Phase 2 to expand the DH pool for contested MH pairs. Not read by Agent 3's main pipeline. | Agent 3 Phase 2 only |
 
 ---
 
@@ -144,7 +144,7 @@ Three cost components flow through the agents. All cost calculations ultimately 
 - Source: CFT vertical lookup, applied to shipment counts from resort/plan_volume
 - What it represents: The volumetric footprint of a shipment; determines how many shipments fit in a truck
 - Used by: Agent 1 (converting shipment counts to CFT volumes), Agent 3 (trunk trip count), Agent 4 (vehicle sizing — whether a DH's demand requires FTL or can be milkrunned)
-- Note: NFBF items typically have higher CFT than FBF, meaning fewer NFBF shipments fill a truck. This makes NFBF lanes more expensive per shipment on the trunk leg.
+- Note: FBF items typically have higher CFT than NFBF, meaning fewer FBF shipments fill a truck per cubic foot. NFBF items are smaller/lighter on average. FBF volume is much higher overall, so FBF lanes dominate total trunk cost.
 
 ---
 

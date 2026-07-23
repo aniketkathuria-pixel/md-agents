@@ -211,3 +211,44 @@ One entry per completed planning cycle. Claude appends automatically after each 
 - OSRM timed out on several NAUGACHIA and SIWANSPLIT inter-hub pairs (firewall); haversine fallback used
 - Known pre-run blockers unchanged: AJLX, IXA3X missing rate card; JLRSF1, KLM1 rate card missing (pre-existing)
 - Preflight status=failed due to AJLX/IXA3X (known) and 11 DHs missing distance data — not blocking for PAT6 run
+
+---
+
+## Agent 4 Freeze-Day Engine — First Real-Data Test (PAT6 + FPT) — 2026-07-23
+
+### Inputs Used
+- Reused Agent 1 output from `run_freeze_day_test_20260722` (day window: day_32 to day_61, June, Day_1 = 1 May)
+- New: `dh_daywise_volume.csv` — day-wise DH demand from `build_sd_plan_aggregate(..., include_daywise=True)`
+- Reused Agent 3 output from `run_freeze_day_test_20260722`: `dh_fc_mh_assignment.csv` (820 DHs)
+- H2H: Consolidated H2H June'26 Network - June'26 H2H.csv (for Current_MR/Current_Freq baseline)
+- Distance matrix: Inputs\Distance Matrix.csv
+- MHDH rate card: Inputs\MHDH_RateCard.xlsx
+- DH Feasibility: Inputs\DH Feasibility.csv
+- Lat Longs: Inputs\Lat Longs.xlsx
+- Scope: CENTRALHUB_L_PAT6 (65 DHs) + CENTRALHUB_FPT (30 DHs) only, 95 DHs total
+
+### Agent 3 Results
+- Carried forward unchanged from `run_freeze_day_test_20260722` (552 speed-assigned, 268 cost-assigned, 0 errors)
+
+### Phase 2 Results
+- Not run this cycle (new-engine validation only)
+
+### Agent 4 Results (new freeze-day engine, `agent4_freeze_day.py`)
+- **This was a 3-pass run.** Pass 1 surfaced two real bugs (day-column-numbering collision corrupting real demand, and a mislabeling bug from the same root cause). Pass 2 (after those fixes) prompted a user question — "why isn't the peak day's adhoc% zero?" — which led to discovering a third bug: FTL/dedicated residual double-counted against milkrun capacity, affecting every spillover simulation call in the engine. Pass 3 (below) is the final corrected result. See PLAYBOOK.md "Known patterns" for all three.
+- Also implemented and verified during this cycle: freq-2 day-reversion for spillover simulation, real shift-adjusted baseline departure timing (was hardcoded to 0), `Per_Day_Route_Log.csv`/`All_Days_Spillover.csv`/`Best_Network_Spillover.csv`, `Adhoc_Route_Summary.csv` (standing-backup-route suggestions), `Route_Visualizer.html`, and a callable single-day ad-hoc runner (`run_freeze_day_single_day`) for out-of-band requests like "run PAT6 for day 16".
+- **Final corrected results (post all 3 bug fixes):**
+
+| MH | DHs | Optimal day | Adhoc% | Committed/mo | Adhoc/mo | Total/mo | Baseline/mo | Savings/mo |
+|---|---|---|---|---|---|---|---|---|
+| CENTRALHUB_L_PAT6 | 65 | D47 (real day) | 9.2% | ₹1,18,12,529 | ₹7,57,089 | ₹1,25,69,618 | ₹1,49,62,039 | ₹23,92,421 (~16.0%) |
+| CENTRALHUB_FPT | 30 | D33 (real day) | 8.6% | ₹35,69,667 | ₹2,04,453 | ₹37,74,120 | ₹41,18,416 | ₹3,44,297 (~8.4%) |
+
+- Status: ok
+- Output folder: `Agent4_Routing\output\run_freeze_day_final_20260723\`
+
+### Notes
+- FPT now finds a day within the 10% `adhoc_pct_limit` (8.6%) for the first time — the earlier 29–31% figures (pass 2) were themselves a symptom of the double-counted-residual bug, not a real network characteristic.
+- Mandatory OSRM reporting: 2 pairs failed via network timeout (not missing data) — `SATELLITEHUB_KURALI → SATELLITEHUB_YAMUNANAGAR`, `SATELLITEHUB_KURALI → SATELLITEHUB_BARNALA1`. Retry if these pairs need to be filled.
+- Several ad-hoc routes flagged "Consider as standing backup route" (recur ≥7 times/month), e.g. `CENTRALHUB_L_PAT6 → SATELLITEHUB_TAMKUHIRAJ → CENTRALHUB_L_PAT6` (9 uses, ₹74,809 total) — candidates for promotion to a standing route.
+- Full internal progress logging (per-MH, per-freeze-day-candidate, per-truck-upgrade-iteration) added this cycle via an `on_progress` callback, matching legacy `agent4.py`'s convention — verified streaming correctly to a background task log.
+- The peak-day-should-be-0%-adhoc question that surfaced the third bug is a good general sanity check to re-run after any future change to the spillover/FTL logic — verify `compute_spillover_day` on the max-demand synthetic day shows zero spillover before trusting a run's numbers.

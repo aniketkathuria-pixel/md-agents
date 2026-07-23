@@ -277,6 +277,9 @@ def build_location_file(
     dh_feasibility_df: pd.DataFrame,
     phase2_accepted_changes: Optional[dict[str, str]] = None,
     time_window_overrides: Optional[dict[str, dict[str, Any]]] = None,
+    h2h_df: Optional[pd.DataFrame] = None,
+    daywise_df: Optional[pd.DataFrame] = None,
+    cfg: Optional[dict[str, Any]] = None,
 ) -> dict:
     """Assemble the Location File DataFrame from Agent 3 output + DH Feasibility.
 
@@ -297,15 +300,39 @@ def build_location_file(
         key may be an MH name (applies to all DHs under that MH) or a DH key.
         DH-level overrides are applied second and beat MH-level overrides.
 
+    h2h_df: optional H2H network DataFrame (IN1202). When supplied, adds
+        Current_MR / Current_Freq columns (current operational baseline —
+        which MR group each DH runs in today, and at what frequency) for the
+        freeze-day engine's baseline comparison. Pass None (default) if not
+        needed — output is unchanged from today when omitted. DH-name casing
+        is normalised (upper+strip) on both sides before the join; unmatched
+        DHs get NaN for both columns and are reported as an issue (non-fatal).
+        Column names read from cfg: col_h2h_dh_key, col_h2h_mr_number,
+        col_h2h_frequency.
+
+    daywise_df: optional day-wise demand DataFrame (Agent 1's
+        `dh_daywise_volume.csv`, keyed by destination_hub_key). When supplied,
+        merges in D1..D<n> (shipment counts) and D1_cft..D<n>_cft (CFT volume)
+        for the freeze-day engine's day-by-day simulation. Pass None (default)
+        if not needed — output is unchanged from today when omitted.
+
+    cfg: optional config dict (see load_agent4_config). Only consulted for the
+        col_h2h_* keys above when h2h_df is supplied; falls back to defaults
+        (load_agent4_config()) if not given. Not needed at all when h2h_df and
+        daywise_df are both None.
+
     Output columns: destination_hub_key, current_fc_mh, total_cft,
                     top266_shipments, total_shipments, ML,
-                    time_window_start, depot_departure, time_window_end.
+                    time_window_start, depot_departure, time_window_end,
+                    plus Current_MR/Current_Freq (if h2h_df given) and
+                    D1..D<n>/D1_cft..D<n>_cft (if daywise_df given).
 
     Returns
     -------
     {"status": "ok" | "partial", "data": pd.DataFrame, "issues": [...]}
     status="partial" when any DH has no ML in DH Feasibility (null-ML rows are
-    included in data so the caller can decide to drop or fill them).
+    included in data so the caller can decide to drop or fill them), or when
+    h2h_df is supplied and some DHs have no matching H2H baseline row.
     """
     issues: list[dict] = []
 
@@ -381,7 +408,50 @@ def build_location_file(
             "detail": f"No ML found in DH Feasibility for {dh}",
         })
 
-    status = "partial" if null_ml_dhs else "ok"
+    # status below is based on null_ml_dhs / h2h_unmatched / no_daywise only —
+    # deliberately NOT phase2_dh_not_found, to preserve exact pre-existing
+    # status behavior for the Phase 2 call path (which never checked that flag).
+    h2h_unmatched: list[str] = []
+    no_daywise: list[str] = []
+
+    # Optional: H2H current-operational baseline (Current_MR / Current_Freq)
+    if h2h_df is not None:
+        _cfg     = cfg if cfg is not None else load_agent4_config()
+        h2h_dh   = _cfg.get("col_h2h_dh_key", "Dest")
+        h2h_mr   = _cfg.get("col_h2h_mr_number", "MR Number")
+        h2h_freq = _cfg.get("col_h2h_frequency", "frequency Final")
+
+        h2h = h2h_df.copy()
+        h2h["_dh_norm"] = h2h[h2h_dh].astype(str).str.strip().str.upper()
+        h2h = h2h.drop_duplicates(subset="_dh_norm", keep="first")
+
+        merged["_dh_norm"] = merged["destination_hub_key"].astype(str).str.strip().str.upper()
+        merged = merged.merge(
+            h2h[["_dh_norm", h2h_mr, h2h_freq]].rename(
+                columns={h2h_mr: "Current_MR", h2h_freq: "Current_Freq"}),
+            on="_dh_norm", how="left",
+        ).drop(columns=["_dh_norm"])
+
+        h2h_unmatched = merged.loc[merged["Current_MR"].isna(), "destination_hub_key"].tolist()
+        for dh in h2h_unmatched:
+            issues.append({
+                "type": "h2h_no_match",
+                "detail": f"No H2H baseline row for {dh} — excluded from baseline comparison",
+            })
+
+    # Optional: day-wise demand (D1..D<n>, D1_cft..D<n>_cft)
+    if daywise_df is not None:
+        merged = merged.merge(daywise_df, on="destination_hub_key", how="left")
+        day_val_cols = [c for c in daywise_df.columns if c != "destination_hub_key"]
+        no_daywise = merged.loc[merged[day_val_cols].isna().all(axis=1), "destination_hub_key"].tolist() \
+            if day_val_cols else []
+        for dh in no_daywise:
+            issues.append({
+                "type": "daywise_no_match",
+                "detail": f"No day-wise demand found for {dh}",
+            })
+
+    status = "partial" if (null_ml_dhs or h2h_unmatched or no_daywise) else "ok"
     return {"status": status, "data": merged, "issues": issues}
 
 

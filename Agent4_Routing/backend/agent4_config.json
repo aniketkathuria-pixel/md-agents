@@ -12,5 +12,15 @@
   "col_mh_assignment": "current_fc_mh",
   "col_demand": "total_cft",
   "col_top266_load": "top266_shipments",
-  "col_ml": "ML"
+  "col_ml": "ML",
+  "adhoc_premium": 1.25,
+  "adhoc_floor_monthly": 90000,
+  "merge_window_min": 120,
+  "adhoc_pct_limit": 0.10,
+  "spill_threshold_pct": 0.20,
+  "adhoc_repeat_threshold_days": 7,
+  "zero_day_threshold": 5,
+  "col_h2h_dh_key": "Dest",
+  "col_h2h_mr_number": "MR Number",
+  "col_h2h_frequency": "frequency Final"
 }

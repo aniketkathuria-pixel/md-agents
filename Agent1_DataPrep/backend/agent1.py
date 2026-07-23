@@ -1357,9 +1357,17 @@ def build_sd_plan_aggregate(
     cft_vertical_df: Optional[pd.DataFrame] = None,
     config: Optional[dict] = None,
     chunksize: int = 100_000,
+    include_daywise: bool = False,
 ) -> dict[str, Any]:
     """
     Combine Alpha (FBF) + Alite + NFBF SD plan data into one (MH1 × LMHub) demand table.
+
+    include_daywise: when True, also returns result["daywise_data"] -- a DH-level
+        (not MH1 x DH) day-by-day table: destination_hub_key, D1..D<n> (shipment
+        counts), D1_cft..D<n>_cft (CFT volume), summed across all three streams.
+        Computed from the SAME chunked read as the existing lane aggregate --
+        no second pass over alpha/alite/nfbf files. Default False preserves
+        existing behavior/performance exactly (no extra columns are computed).
 
     Two calling modes — mix and match per stream:
       Path mode (recommended for large files):
@@ -1423,20 +1431,25 @@ def build_sd_plan_aggregate(
         cft_col: str,
         cft_fallback: float,
         day_cols: list[str],
-    ) -> Optional[pd.DataFrame]:
+    ) -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
         """
         Per-chunk processing: EKL filter → normalise → CFT → groupby reduce.
-        Returns a small aggregated DataFrame (source, destination_hub, day_cols, _avg_daily, _cft_vol)
-        or None if chunk is empty after filter.
+        Returns (lane_df, daywise_df):
+          lane_df    - grouped by (source, destination_hub): day_cols sums +
+                       _avg_daily/_cft_vol. Unchanged from before -- feeds
+                       augpeak/augmedian downstream. None if chunk empty after filter.
+          daywise_df - only computed when include_daywise=True: grouped by
+                       destination_hub ONLY (source dropped), day_N shipment
+                       sums + day_N x row-CFT sums. None otherwise.
         """
         d = chunk.copy()
         vendor_col = next((c for c in d.columns if _norm_str(c) == "vendor"), None)
         if vendor_col is None:
-            return None
+            return None, None
         ekl_m = d[vendor_col].astype(str).str.strip().str.lower().isin(vendors)
         d = d.loc[ekl_m].copy()
         if d.empty:
-            return None
+            return None, None
 
         if stream == "alite":
             hub_c  = next((c for c in d.columns if _norm_str(c) == "hub"), None)
@@ -1447,7 +1460,7 @@ def build_sd_plan_aggregate(
         dest_c = next((c for c in d.columns if _norm_str(c) == "destination_hub"), None)
         src_c  = next((c for c in d.columns if _norm_str(c) == "source"), None)
         if dest_c is None or src_c is None:
-            return None
+            return None, None
 
         d["destination_hub"] = d[dest_c].astype(str).str.strip().str.upper()
         d["source"]          = d[src_c].astype(str).str.strip().str.upper()
@@ -1465,50 +1478,66 @@ def build_sd_plan_aggregate(
 
         day_present = [c for c in day_cols if c in d.columns]
         if not day_present:
-            return None
+            return None, None
 
-        d["_avg_daily"] = (
-            d[day_present].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
-            / avg_divisor
-        )
+        for c in day_present:
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+
+        d["_avg_daily"] = d[day_present].sum(axis=1) / avg_divisor
         d["_cft_vol"] = d["_avg_daily"] * d["_cft"]
+
+        daywise_df = None
+        if include_daywise:
+            cft_day_cols = [f"{c}__cft" for c in day_present]
+            for c, cc in zip(day_present, cft_day_cols):
+                d[cc] = d[c] * d["_cft"]
+            daywise_df = (
+                d.groupby("destination_hub", sort=False)[day_present + cft_day_cols]
+                .sum().reset_index()
+            )
 
         keep = ["source", "destination_hub"] + day_present + ["_avg_daily", "_cft_vol"]
         d = d[[c for c in keep if c in d.columns]]
 
         day_part = d.groupby(["source", "destination_hub"], sort=False)[day_present].sum().reset_index()
         cft_part = d.groupby(["source", "destination_hub"], sort=False)[["_avg_daily", "_cft_vol"]].sum().reset_index()
-        return day_part.merge(cft_part, on=["source", "destination_hub"], how="left")
+        lane_df = day_part.merge(cft_part, on=["source", "destination_hub"], how="left")
+        return lane_df, daywise_df
 
     def _aggregate_stream_from_path(
         path: Path,
         stream: str,
         cft_col: str,
         cft_fallback: float,
-    ) -> Optional[pd.DataFrame]:
-        """Incremental chunked aggregation from a file path. Peak memory = one chunk + small partials."""
+    ) -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """Incremental chunked aggregation from a file path. Peak memory = one chunk + small partials.
+        Returns (lane_df, daywise_df) -- daywise_df is None unless include_daywise=True.
+        Both come from the SAME chunk loop -- no second read of the file."""
         head = pd.read_csv(path, nrows=0, encoding="utf-8-sig")
         day_cols = _day_cols_from_headers(list(head.columns))
         if not day_cols:
             issues.append(_issue("missing_columns", f"{stream}: no day_{day_start}..day_{day_end} columns in {path.name}"))
-            return None
+            return None, None
 
         day_partials: list[pd.DataFrame] = []
         cft_partials: list[pd.DataFrame] = []
+        daywise_partials: list[pd.DataFrame] = []
         rows_seen = rows_kept = 0
 
         for chunk in pd.read_csv(path, chunksize=chunksize, low_memory=False, encoding="utf-8-sig"):
             rows_seen += len(chunk)
-            proc = _process_chunk(chunk, stream, cft_col, cft_fallback, day_cols)
+            proc, dw = _process_chunk(chunk, stream, cft_col, cft_fallback, day_cols)
             if proc is None or proc.empty:
                 continue
             rows_kept += len(proc)
             day_partials.append(proc[["source", "destination_hub"] + [c for c in day_cols if c in proc.columns]])
             cft_partials.append(proc[["source", "destination_hub", "_avg_daily", "_cft_vol"]])
+            if dw is not None and not dw.empty:
+                daywise_partials.append(dw)
 
         if not day_partials:
             issues.append(_issue("empty_result", f"{stream}: no EKL rows found after chunked read"))
-            return None
+            return None, None
 
         day_agg = (
             pd.concat(day_partials, ignore_index=True)
@@ -1520,23 +1549,33 @@ def build_sd_plan_aggregate(
             .groupby(["source", "destination_hub"], sort=False)[["_avg_daily", "_cft_vol"]]
             .sum().reset_index()
         )
-        return _finalise_stream_lane(day_agg, cft_agg, stream, [c for c in day_cols if c in day_agg.columns])
+        lane_df = _finalise_stream_lane(day_agg, cft_agg, stream, [c for c in day_cols if c in day_agg.columns])
+
+        daywise_df = None
+        if daywise_partials:
+            value_cols = [c for c in daywise_partials[0].columns if c != "destination_hub"]
+            daywise_df = (
+                pd.concat(daywise_partials, ignore_index=True)
+                .groupby("destination_hub", sort=False)[value_cols].sum().reset_index()
+            )
+        return lane_df, daywise_df
 
     def _aggregate_stream_from_df(
         df: pd.DataFrame,
         stream: str,
         cft_col: str,
         cft_fallback: float,
-    ) -> Optional[pd.DataFrame]:
+    ) -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
         """In-memory path for pre-loaded DataFrames."""
         day_cols = _day_cols_from_headers(list(df.columns))
-        proc = _process_chunk(df, stream, cft_col, cft_fallback, day_cols)
+        proc, dw = _process_chunk(df, stream, cft_col, cft_fallback, day_cols)
         if proc is None or proc.empty:
-            return None
+            return None, None
         present_day_cols = [c for c in day_cols if c in proc.columns]
         day_agg = proc[["source", "destination_hub"] + present_day_cols].copy()
         cft_agg = proc[["source", "destination_hub", "_avg_daily", "_cft_vol"]].copy()
-        return _finalise_stream_lane(day_agg, cft_agg, stream, present_day_cols)
+        lane_df = _finalise_stream_lane(day_agg, cft_agg, stream, present_day_cols)
+        return lane_df, dw
 
     def _finalise_stream_lane(
         day_agg: pd.DataFrame,
@@ -1578,11 +1617,11 @@ def build_sd_plan_aggregate(
         if df is not None:
             return _aggregate_stream_from_df(df, stream, cft_col, fallback)
         issues.append(_issue("missing_input", f"{stream}: neither df nor path provided"))
-        return None
+        return None, None
 
-    alpha_lane = _process(alpha_df, alpha_path, "fbf",   "sc",       alpha_fallback)
-    alite_lane = _process(alite_df, alite_path, "alite", "sc",       alite_fallback)
-    nfbf_lane  = _process(nfbf_df,  nfbf_path,  "nfbf",  "vertical", nfbf_fallback)
+    alpha_lane, alpha_daywise = _process(alpha_df, alpha_path, "fbf",   "sc",       alpha_fallback)
+    alite_lane, alite_daywise = _process(alite_df, alite_path, "alite", "sc",       alite_fallback)
+    nfbf_lane,  nfbf_daywise  = _process(nfbf_df,  nfbf_path,  "nfbf",  "vertical", nfbf_fallback)
 
     if all(x is None for x in (alpha_lane, alite_lane, nfbf_lane)):
         return _failed(
@@ -1655,7 +1694,37 @@ def build_sd_plan_aggregate(
     ]
     base = base[[c for c in col_order if c in base.columns]]
 
-    return _ok(base) if not issues else _partial(base, issues)
+    result = _ok(base) if not issues else _partial(base, issues)
+
+    if include_daywise:
+        dw_lanes = [x for x in (alpha_daywise, alite_daywise, nfbf_daywise) if x is not None]
+        daywise_result = None
+        if dw_lanes:
+            combined = pd.concat(dw_lanes, ignore_index=True)
+            value_cols = [c for c in combined.columns if c != "destination_hub"]
+            dwdf = combined.groupby("destination_hub", sort=False)[value_cols].sum().reset_index()
+
+            rename_map: dict[str, str] = {}
+            for c in value_cols:
+                is_cft = c.endswith("__cft")
+                core = c[:-5] if is_cft else c   # strip "__cft"
+                num = core[4:]                    # strip "day_"
+                rename_map[c] = f"D{num}_cft" if is_cft else f"D{num}"
+            dwdf = dwdf.rename(columns=rename_map)
+            dwdf = dwdf.rename(columns={"destination_hub": "destination_hub_key"})
+
+            day_num_cols = sorted(
+                (c for c in dwdf.columns if c.startswith("D") and c[1:].isdigit()),
+                key=lambda c: int(c[1:]),
+            )
+            cft_num_cols = sorted(
+                (c for c in dwdf.columns if c.startswith("D") and c.endswith("_cft") and c[1:-4].isdigit()),
+                key=lambda c: int(c[1:-4]),
+            )
+            daywise_result = dwdf[["destination_hub_key"] + day_num_cols + cft_num_cols]
+        result["daywise_data"] = daywise_result
+
+    return result
 
 
 def build_fbf_network_pathway(

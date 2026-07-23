@@ -84,6 +84,33 @@ r = a4.run_agent4_pipeline(
 
 ---
 
+### Day-column numbering mismatch corrupts synthetic days and mislabels real days (Agent 4 freeze-day engine)
+**Problem:** In `agent4_freeze_day.py`, `_add_synthetic_days` silently overwrote real demand columns, and `run_single_mh_freeze_day` mislabeled real days as synthetic in output (`is_synthetic=True` for a genuinely real day like `D54`).
+**Root cause:** Day columns are named after the *source file's* day numbers (e.g. `D32`...`D61` for a June window starting at `day_32`), not renumbered from 1. Two places wrongly used the day **count** (e.g. 30) instead of the actual max day **number** (e.g. 61): (1) `_add_synthetic_days` computed `synth_start = len(day_cols) + 1` = `D31`, which collided with and overwrote real `D31`-`D37`; (2) `is_synthetic` was computed as `int(freeze_col[1:]) > len(real_day_cols)`, so any real day numbered above the day *count* (e.g. `D54 > 30`) was wrongly flagged synthetic.
+**Solution:** Both fixed to use `max(int(c[1:]) for c in real_day_cols)` instead of `len(real_day_cols)`. Synthetic days are now correctly numbered `max_real_day + 1` through `max_real_day + 7` (e.g. `D62`-`D68` for a `D32`-`D61` window), and `is_synthetic` correctly compares against the max real day number. Verified: real days (`D54`, `D61`) preserved untouched and labeled `is_synthetic=False`; synthetic days (`D62`-`D68`) labeled `True`. This bug affects **any** run where the SD-plan day window doesn't start at `day_1` — i.e. every real run except a literal Month-1 window.
+**Agents involved:** Agent 4 (freeze-day engine)
+**Date:** 2026-07-23
+
+---
+
+### FTL/dedicated residual double-counted against milkrun capacity (Agent 4 freeze-day engine)
+**Problem:** A frozen day sized to each DH's own peak demand should mathematically guarantee 0% ad-hoc (every real day's demand for a DH is, by definition, ≤ its own peak). Instead, real runs showed a DH needing an FTL truck (e.g. `SATELLITEHUB_DANAPUR`, real demand 1,386–2,465 CFT against a 1,550 CFT vehicle cap) spilling on nearly every real day even though its milkrun residual (≤ 915 CFT) comfortably fit its 1,255 CFT milkrun route.
+**Root cause:** `compute_spillover_day`'s dedicated/FTL-overflow section (A) computed the leftover residual after the DH's frozen FTL trucks and spilled it as an ad-hoc **dedicated** route whenever it was `> 0` — but that same leftover is exactly what the DH's own frozen **milkrun** route was already sized to carry. Section B (milkrun overflow) also independently checked this DH's demand, but against the DH's **raw day-demand** instead of the demand net of its own frozen FTL trucks — colab's original code had a `mr_residual()` step for exactly this, which had been missed during porting. Net effect: the same residual demand was checked twice, against two different vehicles, using two different (both wrong) quantities.
+**Solution:** Section A now only spills genuine *extra full-truck-loads* beyond the frozen FTL count (`while after > cap: spill(cap); after -= cap` — no longer any `if after > 0: spill(after)` at the end). Section B now computes each DH's demand via a ported `_mr_residual()` (raw demand minus `n_frozen_ftl × ftl_cap`, capped at one milkrun-cap-sized chunk) before comparing against the milkrun vehicle's capacity. Verified: the peak-day candidate now shows exactly 0 adhoc cost across all 30 real days, as the math requires. **This bug affected every spillover simulation call in the engine, not just peak-day candidates** — re-running PAT6/FPT after the fix changed the optimal day for both MHs and let FPT find a day within the 10% adhoc target for the first time (previously it never met the constraint).
+**Agents involved:** Agent 4 (freeze-day engine)
+**Date:** 2026-07-23
+
+---
+
+### Freq=2 routes need day-pair demand reversion before spillover simulation (Agent 4 freeze-day engine)
+**Problem:** `compute_spillover_day` checked each real day's raw demand against a route's frozen vehicle capacity. For routes the ILP assigned `Freq=2` (runs every *other* day, vehicle sized for 2 days' combined demand), this silently hid real spillover — a route sized for `2×demand` was compared against only 1 day's demand every day, so it never looked full even when the truck genuinely couldn't have handled the real world's every-other-day pickup pattern.
+**Root cause:** No day-reversion step existed. Freq=2 is chosen by the ILP itself per candidate freeze day (route-level, not a fixed DH property) whenever every DH on a route has `Freq_Allowed=1` (no Top266/D1% shipments) and it's cheaper — this was already correctly implemented; only the *spillover simulation* side was missing the corresponding demand adjustment.
+**Solution:** Added `_freq2_dhs_from_final_assignment` (reads `Freq==2` DHs directly off a plan's own `final_assignment_df` — works identically for the optimized freeze-day plan and the baseline's H2H-derived plan, since both carry a `Freq` column) and `_build_freq_reverted_demands` (merges each pair of consecutive days into the second day for freq-2 DHs only: `demand[i+1] += demand[i]; demand[i] = 0`, for `i = 0, 2, 4, ...`). Both are called automatically inside `run_spillover_simulation` — no call-site changes needed anywhere else. Verified: a scenario with raw per-day demand of `700,700,100,100` against a `1255`-CFT cap showed **zero** spillover before the fix (each raw day under cap) and correctly showed `145 CFT` spillover on the merged day after the fix.
+**Agents involved:** Agent 4 (freeze-day engine)
+**Date:** 2026-07-23
+
+---
+
 ## Full pipeline run — June'26 (Agent 1 → Agent 4)
 
 **Date:** 2026-07-20
@@ -322,3 +349,91 @@ Output files land in the `out_dir` passed to the function. This run: `Agent4_Rou
 - Total monthly cost: ₹10,34,09,227 (₹10.34 Cr/mo)
 - Status: ok
 - ILP failures: CENTRALHUB_L_KOL5 (KALIACHAK missing lat/lon), CENTRALHUB_L_PAT6 (BIHTA missing lat/lon) — see standalone pattern below
+
+---
+
+## Agent 4 Freeze-Day Engine (`agent4_freeze_day.py`) — build & run reference
+
+**Date introduced:** 2026-07-22/23
+**Agents involved:** Agent 1 (extended), Agent 4 (new additive module)
+
+### What it is
+
+A new engine sitting *alongside* the legacy `agent4.py` (`run_agent4_pipeline`, `run_agent4_for_mh` etc.) — it does not replace or modify anything Phase 2 depends on. Instead of costing routes against one aggregate demand snapshot, it tests **every day in the SD-plan window + 7 synthetic extreme days** (peak, median, 5 linear interpolation steps) as a candidate frozen route plan, simulates the real days' demand against each candidate (ad-hoc/spillover cost for whatever doesn't fit), and picks whichever minimizes `committed + adhoc` cost subject to `adhoc% <= cfg['adhoc_pct_limit']`. Also builds a costed baseline of the *current* H2H route network for comparison, and includes a truck-upgrade loop (bump vehicle size on routes that spill too often, keep if it lowers total cost).
+
+**Key design decision:** the per-day candidate costing reuses `agent4.run_agent4_for_mh` verbatim (bearing clustering, FTL stripping, soft position constraints, local/zonal costing, ILP set-cover — all already correct there) rather than reimplementing route generation. Only the day-simulation/spillover/baseline layer on top is genuinely new code.
+
+### New Agent 1 output (extends `build_sd_plan_aggregate`, doesn't add a new function)
+
+`build_sd_plan_aggregate(..., include_daywise=True)` now also returns `result["daywise_data"]` — a DH-level (not MH1×DH) day-by-day table: `destination_hub_key`, `D<n>` (shipment counts), `D<n>_cft` (CFT volume), computed from the **same chunked pass** used for the existing lane aggregate (no second read of the 40GB NFBF file). Default `include_daywise=False` preserves the exact prior behavior/performance. Save via `save_dataframe(result["daywise_data"], out_dir / "dh_daywise_volume.csv")`.
+
+### New agent4.py extension (still backward-compatible)
+
+`build_location_file(..., h2h_df=None, daywise_df=None, cfg=None)` — 3 new optional params, all default `None`/no-op. When `h2h_df` given, merges `Current_MR`/`Current_Freq` from the H2H file (columns: `Dest`, `MR Number`, `frequency Final` — case-insensitive DH-name join, since the raw H2H file has inconsistent casing). When `daywise_df` given, merges the day-wise columns above. Existing callers (Phase 2) passing neither param get byte-identical output.
+
+### Call sequence for a real run
+
+```python
+import agent1 as a1, agent4 as a4, agent4_freeze_day as fd
+
+# Agent 1 — day window set as usual (mandatory question), plus include_daywise=True
+r_demand = a1.build_sd_plan_aggregate(
+    alpha_path=..., alite_path=..., nfbf_path=...,
+    mh_dh_mapping_df=mh_dh_df, cft_vertical_df=r_cft["data"],
+    config=cfg1, include_daywise=True,
+)
+a1.save_dataframe(r_demand["daywise_data"], out_dir / "dh_daywise_volume.csv")
+# ... rest of Agent 1 Pipeline A/C/E unchanged ...
+
+# Agent 3 — completely unchanged, run as documented in AGENT3.md
+
+# Agent 4 — new engine
+agent3_df   = pd.read_csv(agent3_out / "dh_fc_mh_assignment.csv")
+daywise_df  = pd.read_csv(agent1_out / "dh_daywise_volume.csv")
+h2h_df      = pd.read_csv(inp / "Consolidated H2H June'26 Network - June'26 H2H.csv")
+feas_df     = pd.read_csv(inp / "DH Feasibility.csv")
+cfg4        = a4.load_agent4_config(agent4_backend / "agent4_config.json")
+mh_configs  = a4.load_rate_card(inp / "MHDH_RateCard.xlsx", cfg4)
+
+loc_res = fd.build_freeze_day_location_file(
+    agent3_df, feas_df, h2h_df, daywise_df, mh_configs, cfg4,
+)
+dist_dict = a4.build_distance_dict(dist_df)["data"]
+latlong   = a4.build_latlong_dict(lat_long_df)["data"]
+
+pipeline_res = fd.run_agent4_freeze_day_pipeline(
+    loc_res["data"], dist_dict, latlong, mh_configs, out_dir, cfg4,
+    on_progress=lambda msg: print(msg, flush=True),   # granular per-MH/per-candidate-day/per-upgrade-iteration logs
+)
+fd.write_route_visualizer(pipeline_res["data"]["per_mh_results"], latlong, out_dir, cfg4)
+```
+
+**Restricting to specific MHs**: filter `agent3_df`/`mh_configs` to the target MHs *before* calling `build_freeze_day_location_file`/`run_agent4_freeze_day_pipeline` — e.g. `agent3_df[agent3_df["current_fc_mh"].isin(["CENTRALHUB_L_PAT6", "CENTRALHUB_FPT"])]`.
+
+**Ad-hoc single-day question** (e.g. "run PAT6 for day 16"): use `fd.run_freeze_day_single_day(mh_name, mh_cfg, dh_rows, "D16", dist_dict, latlong, cfg4, out_dir=..., baseline=baseline_result)` — freezes at exactly that day instead of searching all candidates, reuses every existing helper, writes `FA_/ES_/SP_/BVO_<mh>_<day>.csv`. Rejects synthetic days (only real day columns are valid — simulating a synthetic day against real demand isn't meaningful).
+
+### New config keys (`agent4_config.json`)
+
+| Key | Default | Effect |
+|---|---|---|
+| `adhoc_premium` | 1.25 | Multiplier on ad-hoc truck cost vs. the base rate |
+| `adhoc_floor_monthly` | 90000 | Floor for ad-hoc route cost (÷30 × premium = daily floor) |
+| `merge_window_min` | 120 | Max cutoff-time spread (minutes) for merging spilled DHs into one ad-hoc route |
+| `adhoc_pct_limit` | 0.10 | Max acceptable ad-hoc% of trips for a freeze day to be "eligible"; falls back to unconstrained optimum with a warning if no day qualifies |
+| `spill_threshold_pct` | 0.20 | Spill-day fraction (of a route's monthly trips) above which the truck-upgrade loop tries a bigger vehicle |
+| `adhoc_repeat_threshold_days` | 7 | An ad-hoc route recurring this many times/month gets flagged "Consider as standing backup route" |
+| `zero_day_threshold` | 5 | Zero-demand-day count above which a DH's day series uses circular redistribution (Case A) instead of local interpolation (Case B) |
+| `col_h2h_dh_key` / `col_h2h_mr_number` / `col_h2h_frequency` | `"Dest"` / `"MR Number"` / `"frequency Final"` | H2H column names for the Current_MR/Current_Freq merge |
+
+### Output files (written to `out_dir` by `run_agent4_freeze_day_pipeline`)
+
+`Location_File.csv` (always saved here — never left in-memory only, never written to `Inputs\`), `Freeze_Day_Comparison.csv`, `Final_Assignment.csv`, `Expanded_Schedule.csv`, `Baseline.csv`, `Baseline_vs_Optimal.csv`, `Network_Summary.csv`, `Per_Day_Route_Log.csv`, `All_Days_Spillover.csv`, `Best_Network_Spillover.csv`, `Adhoc_Route_Summary.csv`. Plus `route_data.json` + `Route_Visualizer.html` from `write_route_visualizer()` (a Leaflet-based interactive map — toggle freeze days, compare against current/baseline routes).
+
+### Known limitations / not yet ported
+
+- Matplotlib chart generation (colab Block 12) — not ported, low priority
+- Google Sheets I/O — intentionally dropped; local files only
+
+### PAT6 + FPT test run — 2026-07-23 (see RUN_HISTORY.md for full detail)
+
+First real-data validation, on top of the June'26 Agent 1/Agent 3 outputs (`run_freeze_day_test_20260722`). Caught and fixed two real bugs (day-column-numbering collision, freq-2 spillover reversion missing) — see "Known patterns" above. Final corrected result: PAT6 optimal=D65 (synthetic), 8.7% adhoc, ₹20.17L/mo savings vs. baseline; FPT optimal=D54 (real day), 31.3% adhoc, ₹4.48L/mo savings vs. baseline.

@@ -18,10 +18,10 @@ Work like a capable employee — take ownership, execute, report back.
 ---
 
 ## Project Root
-`C:\Users\aniket.kathuria\Desktop\Agentic tools\`
+`Agentic tools\` (the folder containing this file)
 
 ## All Inputs — Single Location
-`C:\Users\aniket.kathuria\Desktop\Agentic tools\Inputs\`
+`Inputs\`
 Never read inputs from any other location. If a file is missing here, stop and ask.
 
 ## Mandatory Self-Check — Before Every Action

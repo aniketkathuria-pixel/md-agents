@@ -222,6 +222,24 @@ Shared by the planning team each planning cycle (monthly). The 3-month window me
 
 ---
 
+## IN1005 — Day-wise DH Demand (`dh_daywise_volume.csv`, Agent 1 output)
+
+**Produced by:** `build_dh_daywise_volume()` in `agent1.py`, run in the same pass as `build_plan_volume`/`build_sd_plan_aggregate` (reuses the same chunked read of IN0902/IN1003/IN1004 — no separate file re-read).
+
+### What it represents
+Per-DH, day-by-day demand for the selected 30-day window, in two units: `D1`...`D30` (shipment counts) and `D1_cft`...`D30_cft` (CFT volume). Built by retaining the day-level sums that `build_sd_plan_aggregate` already computes internally (today it collapses them into a single peak/median before output) and multiplying each day's shipment count by that row's per-vertical/SC CFT estimate, before collapsing across FBF+NFBF+Alite streams to DH level (MH/stream breakdown dropped — not needed downstream).
+
+### Why it exists
+Unlike `plan_volume.csv` (one aggregate `total_cft` per DH for the whole window), Agent 4's freeze-day engine needs actual day-to-day variability to simulate which frozen route plan holds up best across a real month, and to compute ad-hoc/spillover cost for the demand that doesn't fit a frozen plan on any given day.
+
+### How it is used in the system
+Agent 4's freeze-day engine merges this onto the location file (keyed by `destination_hub_key`), then derives synthetic peak/median extreme days (`D31`...`D37`) on top of it before running the freeze-day search.
+
+### Update cadence
+Regenerated every time Agent 1 runs, same cadence as `plan_volume.csv`.
+
+---
+
 ## IN1101a — LM PBH (Customer Pincode to DH Mapping)
 
 ### What it represents
@@ -344,18 +362,26 @@ Updated on network cycle when inventory distribution changes — new FCs going l
 
 ## IN1202 — H2H Network (DH to MR Route Grouping)
 
-**Current file:** `Consolidated H2H June'26 Network.csv`
+**Current file:** `Consolidated H2H June'26 Network - June'26 H2H.csv`
 
 ### What it represents
 The current operational MH-DH route structure as planned and agreed with ground operations each network cycle. For each DH, it records which MH serves it and which MR (Milkrun Route) number it belongs to.
 
 **MR number** is the ground-level route identifier. DHs sharing the same MH and the same MR number are currently running together on one truck. "Direct" means the vehicle goes directly to that DH with no milkrun grouping.
 
+### Exact columns used
+`Src, Dest, cc, Peak Demand, Median demand, city, lpst, MR Number, tt Final, frequency Final, sla, TMS, landing day, Landing time, LRT Timing`
+
+Only three are consumed downstream:
+- `Dest` — DH key. **Casing is inconsistent in the raw file** (e.g. `SatelliteHub_SasaramSplit` vs `SATELLITEHUB_AYODHYA`) — must be uppercased/stripped before joining to `destination_hub_key`.
+- `MR Number` — current milkrun group id, or `"Direct"` for no grouping.
+- `frequency Final` — current trip frequency (1 or 2/day) for that DH's route. Note the lowercase "frequency".
+
 ### What it is used for here
-This file is used in Phase 2 only, and only for one purpose — to establish the **current operational baseline** of which DHs run together. This baseline is compared against the optimised routes proposed by Agent 4, to measure whether the optimised solution is actually better than what is running on the ground today.
+Used in Phase 2 (to establish the current operational baseline of which DHs run together, compared against Agent 4's optimised routes) **and** by Agent 4's freeze-day baseline engine, which maps `Dest`→`Current_MR`, `frequency Final`→`Current_Freq` onto the location file to cost "what's running today" against the optimised freeze-day plan.
 
 ### Note on scope
-The H2H file is a much richer file in the broader supply chain context — it contains all network connections and routes. Only the DH → MH → MR number relationship is consumed here. Its full depth is not used in the current system.
+The H2H file is a much richer file in the broader supply chain context — it contains all network connections and routes. Only the DH → MH → MR number → frequency relationship is consumed here. Its full depth is not used in the current system.
 
 ### Update cadence
 Updated every network cycle, as route planning with ground operations is done monthly.

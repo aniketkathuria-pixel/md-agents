@@ -249,7 +249,7 @@ Returns `{"status": "ok"|"partial"|"failed", "data": {"excel_paths": [...], "sum
 
 **Tuple semantics:** each `(from_mh, to_mh)` tuple means `from_mh` is the **current** assignment of the flagged DHs and `to_mh` is the **proposed new** assignment. `run_phase2` filters `dh_fc_mh_assignment.csv` on `current_fc_mh == from_mh AND assigned_fc_mh == to_mh`. Passing them reversed will find zero flagged DHs and produce an empty pool.
 
-**`agent4_backend_path`:** must be the directory containing `agent4_pipeline.py`. Current value: `C:\Users\aniket.kathuria\Desktop\Claude\Agent 4\backend`. After Agent 4 rewrite: `C:\Users\aniket.kathuria\Desktop\Agentic tools\Agent4_Routing\backend`. The function inserts this path into `sys.path` at call time and imports `agent4_pipeline as p4`. See §8 for the full Agent 4 interface requirement.
+**`agent4_backend_path`:** must be the directory containing `agent4_pipeline.py` — use `Agent4_Routing\backend`. The function inserts this path into `sys.path` at call time and imports `agent4_pipeline as p4`. See §8 for the full Agent 4 interface requirement.
 
 ---
 
@@ -261,8 +261,7 @@ Returns `{"status": "ok"|"partial"|"failed", "data": {"excel_paths": [...], "sum
 import pandas as pd
 from pathlib import Path
 import sys
-sys.path.insert(0, r"C:\Users\aniket.kathuria\Desktop\Agentic tools\Agent3_Clustering\backend")
-sys.path.insert(0, r"C:\Users\aniket.kathuria\Desktop\Claude\Agent 3\backend")  # for agent3_pipeline (imported by agent3.py)
+sys.path.insert(0, r"Agent3_Clustering\backend")
 import agent3 as a3
 
 cfg = a3.load_agent3_config(Path(r"...\backend\agent3_config.json"))
@@ -346,7 +345,7 @@ r2 = a3.run_phase2(
     h2h_df=pd.read_csv(h2h_path),
     cfg=cfg,
     output_dir=phase2_out,
-    agent4_backend_path=Path(r"C:\Users\aniket.kathuria\Desktop\Claude\Agent 4\backend"),
+    agent4_backend_path=Path(r"Agent4_Routing\backend"),
 )
 ```
 
@@ -390,7 +389,7 @@ cost_opps   = a3.build_cost_only_opportunities(agent3_df) # DHs Agent 3 kept (in
 
 ## 5. Config Reference
 
-`agent3_config.json` is at `C:\Users\aniket.kathuria\Desktop\Claude\Agent 3\backend\agent3_config.json`. `load_agent3_config` merges file values over `_CONFIG_DEFAULTS` — only keys present in `_CONFIG_DEFAULTS` are accepted from the file; unknown keys in the JSON are ignored.
+`agent3_config.json` is at `Agent3_Clustering\backend\agent3_config.json`. `load_agent3_config` merges file values over `_CONFIG_DEFAULTS` — only keys present in `_CONFIG_DEFAULTS` are accepted from the file; unknown keys in the JSON are ignored.
 
 | Key | Default | In JSON file | Description |
 |---|---|---|---|
@@ -519,14 +518,9 @@ else:
 
 Each Agent 4 ILP call typically takes 1–10 seconds depending on pool size and cluster count. Warn the user if `ilp_calls > 200` (> ~10 minutes expected).
 
-### `agent4_backend_path` — current vs post-rewrite
+### `agent4_backend_path`
 
-| State | Path |
-|---|---|
-| **Current (old Agent 4)** | `C:\Users\aniket.kathuria\Desktop\Claude\Agent 4\backend` |
-| **After Agent 4 rewrite** | `C:\Users\aniket.kathuria\Desktop\Agentic tools\Agent4_Routing\backend` |
-
-`run_phase2` inserts this path into `sys.path` at call time. After the Agent 4 rewrite, update this path in every call to `run_phase2`. The old Agent 4 code at `Claude\Agent 4\backend` should still work for Phase 2 as long as its `agent4_pipeline.py` exposes the interface above.
+Always pass `Agent4_Routing\backend`. `run_phase2` inserts this path into `sys.path` at call time and imports `agent4_pipeline as p4`.
 
 ---
 

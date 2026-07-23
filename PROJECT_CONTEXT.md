@@ -13,7 +13,7 @@ This is a linehaul network design engine for Flipkart's middle-mile logistics. C
 ## 2. Folder Structure
 
 ```
-C:\Users\aniket.kathuria\Desktop\Agentic tools\
+Agentic tools\
 │
 ├── SUPPLY_CHAIN_CONTEXT.md       — Network terminology, hub hierarchy, cost primitives, SLA
 ├── PROJECT_CONTEXT.md            — This file: data flow, orchestration, checkpoints
@@ -68,7 +68,7 @@ C:\Users\aniket.kathuria\Desktop\Agentic tools\
             └── validation_report_agent4.txt
 ```
 
-**Note on inputs:** The Inputs folder is the canonical location. Some files are still at the old location (`C:\Users\aniket.kathuria\Desktop\Claude\`) and need to be copied across before a clean run. Do not read inputs from the old location — copy them to `Inputs\` first and use the canonical path from there.
+**Note on inputs:** `Inputs\` is the single source of truth. All input files must be here before a run. If a file is missing, stop and ask — do not look elsewhere.
 
 ---
 
@@ -222,18 +222,14 @@ Also present:
    - `Agent3_Clustering\AGENT3.md`
    - `Agent4_Routing\AGENT4.md`
 
-3. **Single input folder:** All raw input files are at:
-   ```
-   C:\Users\aniket.kathuria\Desktop\Agentic tools\Inputs\
-   ```
-   This is the single source of truth. Never read inputs from any other location. If a required file is not in this folder, stop and ask the user to copy it here — do not look for it elsewhere.
+3. **Single input folder:** All raw input files are at `Inputs\`. Never read inputs from any other location. If a required file is not in this folder, stop and ask the user to copy it here.
 
 4. **Key input paths:**
    ```
-   DH Feasibility:   C:\Users\aniket.kathuria\Desktop\Agentic tools\Inputs\DH Feasibility.csv
-   Distance Matrix:  C:\Users\aniket.kathuria\Desktop\Agentic tools\Inputs\Distance Matrix.csv
-   MHDH Rate Card:   C:\Users\aniket.kathuria\Desktop\Agentic tools\Inputs\MHDH_RateCard.xlsx
-   MH1-MH2 Rate Card: C:\Users\aniket.kathuria\Desktop\Agentic tools\Inputs\MH1-MH2 Rate Card.csv
+   DH Feasibility:    Inputs\DH Feasibility.csv
+   Distance Matrix:   Inputs\Distance Matrix.csv
+   MHDH Rate Card:    Inputs\MHDH_RateCard.xlsx
+   MH1-MH2 Rate Card: Inputs\MH1-MH2 Rate Card.csv
    ```
 
 5. **No orchestrator state file.** There is no `orchestrator_state.json` in the new structure. Claude discovers run state by scanning the Inputs folder and reading the pre-call checklists in each AGENT MD.
@@ -348,11 +344,11 @@ Report results concisely. If a new pattern was discovered, draft a PLAYBOOK entr
 
 ## 10. PLAYBOOK and RUN_HISTORY
 
-**PLAYBOOK.md** (`C:\Users\aniket.kathuria\Desktop\Agentic tools\PLAYBOOK.md`)
+**PLAYBOOK.md**
 
 Stores reusable problem→solution patterns discovered across runs (e.g. "when OSRM fails for a city cluster, pre-fill distance pairs from Google Maps export"). Claude checks PLAYBOOK at the start of every task and mentions any relevant entry to the user before starting. Claude never auto-appends to PLAYBOOK — it drafts a candidate entry and asks the user whether to add it.
 
-**RUN_HISTORY.md** (`C:\Users\aniket.kathuria\Desktop\Agentic tools\RUN_HISTORY.md`)
+**RUN_HISTORY.md**
 
 One entry per completed planning cycle, appended automatically by Claude after a run completes. Format:
 
@@ -369,27 +365,4 @@ One entry per completed planning cycle, appended automatically by Claude after a
 
 ## 10. Known Pre-run Blockers
 
-The following must be resolved before a clean full run is possible. Until resolved, affected steps will return `status=partial`.
-
-### Category 1 — MHDH Rate Card Gaps
-4 MHs missing from MHDH rate card — milkrun cost cannot be calculated for DHs assigned to these MHs:
-- CENTRALHUB_LM_AJLX
-- IXA3X
-- JLRSF1
-- KLM1
-
-**Impact:** Agent 3 cost estimates and Agent 4 routing will be incomplete for DHs serving under these MHs. `preflight_check` will flag them.
-
-### Category 2 — Distance Matrix Gaps
-2 MHs missing from the distance matrix (specific MH codes flagged at runtime by `preflight_check`). OSRM will be attempted as fallback; if OSRM is unavailable, haversine approximation will be used and logged to `osrm_fallback_log.csv`.
-
-**Impact:** Route cost estimates for affected MHs will use approximate distances. `status=partial` on Agent 4 for those MHs.
-
-### Category 3 — DH Feasibility File Gaps
-12 SATELLITEHUB DHs are missing their ML (maximum load, in tonnes) value in DH Feasibility.csv. These DHs cannot be sized for FTL vs milkrun in Agent 4:
-- ABHOR1, BARNALA1, BATALA1, FKHMBD, FKMYS2, FRDNEW, KHANNA1, KIRARI, MANSAROVER, NOIDAPHASE2, ROBERTSGANJ, SIKANDRA
-
-**Impact:** These DHs will be excluded from Agent 4's FTL pre-processing step. They may be misclassified as milkrun candidates regardless of actual demand. Fix: add ML values to DH Feasibility.csv and re-run `build_location_file`.
-
-### Category 4 — Agent 4 OSRM Configuration
-Agent 4 has no `use_osrm_fallback` config key — OSRM is always attempted when a distance pair is missing from the pre-filled matrix. There is no config toggle to disable OSRM. To prevent OSRM calls entirely, pre-fill all required distance matrix pairs before running Agent 4.
+See `CLAUDE.md § Known Pre-run Blockers` — maintained there as the single source of truth.
