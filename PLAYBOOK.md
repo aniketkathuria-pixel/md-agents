@@ -479,3 +479,20 @@ Of 55 total routes across both MHs, only **1** needed a dock-forced TMS shift aw
 
 **Agents involved:** Agent 4 (freeze-day engine + dock-scheduling module)
 **Date:** 2026-07-23
+
+---
+
+### Dock Utilization visualizer — added as a default output of dock scheduling
+
+**Problem:** The dock-scheduling CSVs (`Dock_Schedule.csv`, `Route_Speed.csv`, etc.) show what happened but not *why* — which routes actually shared a dock, whether contention was real, and which routes got dock-forced away from their ideal departure. Needed a way to see dock utilization at a glance, filterable per MH.
+
+**Solution:** Added `build_dock_utilization_data`, `_speed_status`, `_assign_dock_rows`, `_build_dock_utilization_html`, and `write_dock_utilization_visualizer` to `agent4_dock_scheduling.py`. Renders a self-contained (no external chart library, no build step) Gantt-style HTML timeline: one lane per physical dock (committed lanes + a greyed reserved-for-adhoc band), one bar per route spanning its actual occupancy window (`Placement_Time` → `TMS + dock_transition_buffer_min`), colored by a speed-status bucket (good ≥90% / warning 75–90% / serious 50–75% / critical <50%, never color-alone — dashed vs. solid borders also distinguish Milkrun vs. FTL), a thin marker on any route whose TMS was dock-forced away from its unconstrained ideal, hover tooltips, and a Table-view toggle for full accessibility.
+
+**Dock-row assignment is a visualization construct, not the model's own decision:** the ILP only enforces a capacity *count* at each point in time — it never assigns a specific dock identity to a route. `_assign_dock_rows` uses greedy earliest-finish-time interval partitioning to produce a display-only dock assignment. Because interval graphs are perfect graphs, this greedy assignment is mathematically guaranteed to never need more rows than the ILP's own committed-dock count already certified as feasible.
+
+**Wired in as a default output, not a manual step** (per explicit user instruction): `run_dock_scheduling_for_all_mhs` now calls `write_dock_utilization_visualizer` automatically at the end, alongside the four CSVs — `Dock_Utilization.html` + `dock_utilization_data.json` land in the same `out_dir` on every call, and their paths are exposed in the result dict as `data["dock_utilization_html"]` / `data["dock_utilization_json"]`. Verified with a synthetic 2-route/1-dock smoke test (forces a real conflict, confirms the shift-marker renders) and against the real PAT6/FPT data (correct lane counts: PAT6 28 committed + 2 reserved = 30 lanes / 36 bars; FPT 14 committed + 1 reserved = 15 lanes / 19 bars; exactly 1 shift-mark, matching the known real dock-forced shift).
+
+**Can also be regenerated standalone** (e.g. against previously-written CSVs without rerunning the ILP) via `write_dock_utilization_visualizer(schedule_df, route_speed_df, mh_configs, cfg, out_dir)` — if reloading `Dock_Schedule.csv` from disk, parse the `hubs` column back from its string repr with `ast.literal_eval` first (`to_csv` stringifies list columns; `build_dock_utilization_data` handles this automatically when it detects a string).
+
+**Agents involved:** Agent 4 (dock-scheduling module)
+**Date:** 2026-07-23
