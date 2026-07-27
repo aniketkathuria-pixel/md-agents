@@ -37,6 +37,24 @@ Date: [YYYY-MM-DD]
 **Agents involved:** Agent 3 Phase 2
 **Date:** 2026-07-15
 
+### `run_phase2` could not actually execute — two backend modules were missing entirely
+**Problem:** Calling `a3.run_phase2(...)` failed immediately with `ModuleNotFoundError: No module named 'agent3_phase2'`. Checked `git log --all` across the whole repo history — `agent3_phase2.py` and `agent4_pipeline.py` had **never existed in this repo, in any commit**. This matched AGENT3.md's own §9 note ("Phase 2 not tested end-to-end with new agent3.py") — it had never actually been runnable.
+**Root cause:** This "Agentic tools" repo is a from-scratch rewrite of an older, separate project at `C:\Users\aniket.kathuria\Desktop\Claude\Agent 3\` / `Agent 4\` (a fixed-code, non-AI orchestrator). Two backend files that the new `agent3.py`'s `run_phase2()` was written to import were, by mistake, only ever saved into that old project folder — never copied into this repo. Confirmed genuine (not a coincidence) by checking `agent3_phase2.py`: it hardcodes this exact repo's own path (`C:\Users\aniket.kathuria\Desktop\Agentic tools\Agent4_Routing\backend`), and every function/class the new `run_phase2` imports from it (`load_h2h`, `expand_pool`, `optimize_pool_assignment`, `build_pair_output`, `write_excel_outputs`, `MHPairResult`, `Phase2Result`, `_mhmh_cost_at_mh`, `_run_a4_subset`, `DAYS_PER_MONTH`) exists there with an exact matching signature. The old file's own top-level orchestrator functions (`run_phase2_pipeline`, `compute_mh_pair_savings`) are the old project's fixed-code entry points and are **not** used by the new `agent3.py` (which reimplements that orchestration loop itself, since Claude is the orchestrator now) — harmless to leave present, unused.
+**One real bug found in this repo's own code:** `agent3.py`'s `run_phase2()` did `import agent4_pipeline as p4` — a module name that never existed anywhere, in either project. The old `agent3_phase2.py` itself correctly does `import agent4 as p4` (targeting the real, current, rewritten `agent4.py`). The old `Agent 4\backend\agent4_pipeline.py` found alongside it is a genuinely **older, pre-rewrite version** of `agent4.py` (1146 lines vs. today's 1698 — missing `n_docks`, contextvar-based OSRM logging, etc.) and must **not** be copied in — it would shadow/conflict with the current, tested `agent4.py`.
+**Solution:**
+1. Copied `agent3_phase2.py` (unmodified) and its own dependency `agent3_pipeline.py` (only satisfies an unused top-level import inside `agent3_phase2.py`'s dead `run_phase2_pipeline` path — safe, standard-library + numpy/pandas only, no further cascading dependencies) into `Agent3_Clustering\backend\`.
+2. Fixed the one-line import in `agent3.py`'s `run_phase2()`: `import agent4_pipeline as p4` → `import agent4 as p4`.
+3. Reran Phase 2 for `CENTRALHUB_L_VNS4 → CENTRALHUB_L_GOP1` end-to-end on real data — `status="ok"`, no issues, completed the 32-combination enumeration ILP cleanly, 3/5 pool DHs moved, ₹4,52,247/mo MHDH saving, −₹67,694/mo MHMH (a cost), ₹3,84,554/mo total. Confirms the "frozen Phase 2 interface" AGENT4.md documents is genuinely intact — no other Agent 4 compatibility issues found.
+**Agents involved:** Agent 3 Phase 2, Agent 4 (interface only, no changes needed)
+**Date:** 2026-07-27
+
+### `build_updated_plan_volume` — first real-data test, on the VNS4→GOP1 Phase 2 acceptance above
+**Setup:** Built `accepted_changes` from the Phase 2 Excel's `Per_DH_Detail` sheet (the 3 DHs that actually moved: `SATELLITEHUB_BASTI`, `SATELLITEHUB_MAHARAJGANJ`, `SATELLITEHUB_MHJ` → `CENTRALHUB_L_GOP1`) and ran `a3.build_updated_plan_volume` against the full real `plan_volume.csv` (206,106 rows).
+**Result:** Ran cleanly end-to-end, no exceptions. 206,106 → 206,104 rows (net −2, expected — each moved DH's several FBF rows collapse to exactly 2: a P1 direct row + a P2 row). `Path_Status`: 205,391 unchanged / 614 verified / 99 estimated — every NFBF/ALITE row for the 3 moved DHs across ~200+ distinct `MH1` sources each got its tail correctly patched. The FBF P1/P2 replace also worked correctly: for all 3 DHs, the P2 leg (`CENTRALHUB_L_PAT6 → CENTRALHUB_L_GOP1`) resolved as `"verified"` — a route that already exists elsewhere in the network (Agent 3's own candidate table had already flagged `PAT6→GOP1` as a separate valid pair, independently confirming this).
+**Real edge case triggered:** `status="partial"`, exactly 3 issues — all `mixed_stream_fbf_caveat`, one per moved DH. All 3 DHs' FBF rows are flagged `has_mixed_streams=True` in real data, so their median/peak/CFT re-split should be reviewed rather than fully trusted — exactly the caveat the function was designed to surface rather than silently hide.
+**Agents involved:** Agent 3 (`build_updated_plan_volume`)
+**Date:** 2026-07-27
+
 ### MANDATORY — Never report a cost number for an MH where ILP failed for any cluster
 **Rule:** `status="ok"` at the pipeline level does not mean every MH's cost is complete — it only means the run finished without a hard error. If `Agent4MHResult.ilp_status` shows `"FAILED"` for any cluster, or `missing_dhs` is non-empty, that MH's reported cost is silently missing an entire cluster's worth of milkrun cost. This must be the headline of that MH's result ("Computation FAILED for [MH] — cluster [id] uncovered, DHs: [list], cost is INCOMPLETE"), never a footnote after presenting a number.
 **Root-cause checklist to give alongside the failure** (in order of likelihood): (1) DH missing from `Lat Longs.xlsx` → bearing defaults to 0° → no valid permutations (see the specific pattern below); (2) missing distance data for a required leg, OSRM also failed; (3) genuinely infeasible time window — the DH is too far from its MH for any route composition to arrive before `time_window_end` (check `depot_departure + get_transit_time(dist)` against `time_window_end` directly).
@@ -204,7 +222,7 @@ cost_opps  = a3.build_cost_only_opportunities(agent3_df)  # informational only
 
 **Bug found this run:** An earlier version of the savings table grouped by `assigned_fc_mh` as the "from" MH, which mixed Phase 2 candidates with cost-only opportunities and produced false pairs (e.g. VZG1→VGA1 appeared with 4 DHs but was invalid — Agent 3 never moved any DH from VZG1 to VGA1). The fix is `build_phase2_candidates`, which groups by `(current_fc_mh, assigned_fc_mh)` where they differ. Always use this function.
 
-**`cost_delta_rs` is per day** — multiply by 30 for monthly savings before presenting to the user.
+**`cost_delta_rs` is per day** — multiply by 30 for monthly savings before presenting to the user. **This bites `build_phase2_candidates` too:** its output column is named `monthly_saving_rs` but is literally `sum(cost_delta_rs)` per pair — a daily figure despite the name. Caught 2026-07-27 by presenting the raw column value to the user labeled "Monthly saving" (it was actually daily). Always ×30 before showing any of `total_cost_rs`/`current_cost_rs`/`monthly_saving_rs` from this table as a monthly number — see AGENT3.md §4 Checkpoint 1 for the same caveat.
 
 **Verifying a pair is valid before Phase 2:**
 - Run: `agent3_df[(agent3_df['current_fc_mh'] == from_mh) & (agent3_df['assigned_fc_mh'] == to_mh)]`
@@ -496,3 +514,26 @@ Of 55 total routes across both MHs, only **1** needed a dock-forced TMS shift aw
 
 **Agents involved:** Agent 4 (dock-scheduling module)
 **Date:** 2026-07-23
+
+---
+
+### Dock scheduling: FTL/MR cutoff sync + daily-recurring time model (two real bugs, one root cause)
+
+**Problem 1 — FTL and Milkrun for the same DH didn't share a cutoff.** A DH split "FTL + Milkrun" (bulk demand on a dedicated truck, residual on a shared route) was scheduled as two completely independent ILP decisions — the same customer's cutoff could differ between its two trucks, which is operationally wrong (colab's original model synced them).
+
+**Problem 2 — the dock model treated time as an unbounded line instead of a repeating daily cycle.** Two symptoms, traced to one root cause:
+- A route made up entirely of low-Top266 (rollover-relaxed) DHs would drift its "ideal" TMS out past 24h — sometimes 48h+ — because nothing constrained it (the rollover mechanism relaxes `time_window_end` by +1440 for route-*generation* purposes) and the speed objective has zero Top266 volume to score there, so the tie-break just let it balloon.
+- Two routes near opposite sides of midnight (e.g. 23:00 and 01:00) were invisible to each other's dock-capacity check — an unbounded linear timeline doesn't know they're only ~2 real clock hours apart on a schedule that repeats every single day, forever.
+
+**Root cause (both symptoms):** the whole model was built as if scheduling a one-time, multi-day snapshot, when the real system runs the identical schedule every single day. A "TMS" is a recurring daily clock value, not a one-time absolute instant that can legitimately land on "day 2."
+
+**Fix (`agent4_dock_scheduling.py`):**
+1. **FTL/MR sync:** a DH's FTL_Dedicated route(s), if that same DH also has a Milkrun route, get no independent ILP variable at all (`linked_ftl` in `schedule_docks_and_compute_speed`) — they inherit the Milkrun route's chosen TMS, while still consuming their own dock-capacity window (2 real trucks, 2 real docks, same clock time). Their DH's Top266 volume is deliberately NOT double-counted in the objective/`dh_speed_df` — it's already scored once via the Milkrun route.
+2. **Daily-cycle time:** the dock-scheduling "ideal" anchor is now computed against each DH's TRUE, un-relaxed deadline (`d1_true_threshold`, always ~1800 min regardless of rollover) instead of the possibly rollover-inflated `time_window_end`, then folded into a genuine single-day clock value via `% 1440`. Dock-capacity windows are checked circularly (`_circular_windows`) against one fixed one-day grid, so a window straddling midnight is correctly seen as adjacent to whatever sits right after it. `_cx_cutoff_hour` simplified to a plain modulo (the old clamp-at-both-ends logic was itself a symptom of the linear-time framing — with `t` now always in `[0,1440)`, the ">=1440 day-boundary" case this was protecting against can no longer occur).
+3. **A bug found in the fix itself, caught by testing:** the pre-existing tie-break ("prefer larger raw TMS," used to mean "prefer less preponing" when time was linear) stopped meaning that once preponing could wrap past midnight — preponing 5.8h from 05:40 wraps to 23:50, a numerically *larger* value despite being a *bigger* step away from the ideal. Fixed by tracking each candidate's actual prepone-step count and tying-breaking on that directly (`step_of`), not on raw clock value. Caught by a synthetic test asserting a zero-Top266 route with no dock contention stays at its own natural ideal — it didn't, until this was fixed.
+
+**Verified with 3 synthetic tests:** (1) FTL+MR for one DH land on the exact same TMS, and the DH appears exactly once in `dh_speed_df`; (2) a route made entirely of a zero-Top266, rollover-relaxed DH stays bounded in `[0,1440)` *and* stays at its true single-day ideal (old code gave ~3,220 min); (3) two routes ~30 real minutes apart across midnight, with only 1 committed dock, are correctly detected as conflicting and resolved (chosen windows verified non-overlapping via `_circular_windows`).
+
+**Known follow-ups, not fixed (flagged, not silently ignored):** the Dock Utilization HTML visualizer draws bars assuming non-wrapping windows — a route whose window now straddles midnight may render oddly; FTL loading-duration is still computed from a DH's *full* `total_shipments` independently for both legs when split (pre-existing simplification, now more visible since the FTL/MR link is formalized).
+**Agents involved:** Agent 4 (dock-scheduling module)
+**Date:** 2026-07-27

@@ -2225,7 +2225,7 @@ def run_phase2(
         _a4_path = str(Path(agent4_backend_path).resolve())
         if _a4_path not in sys.path:
             sys.path.insert(0, _a4_path)
-        import agent4_pipeline as p4
+        import agent4 as p4
 
         agent3_output_dir = Path(agent3_output_dir)
         output_dir = Path(output_dir)

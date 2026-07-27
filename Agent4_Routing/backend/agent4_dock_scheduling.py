@@ -28,6 +28,34 @@ where loading_duration = shipments_on_route / dock_productivity_per_hour.
 
 Does not touch route generation, ILP set-cover, or cost at all -- this is a
 pure post-processing layer on top of an already-selected route plan.
+
+Two fixes (2026-07-27), both flowing from the same root cause -- see
+PLAYBOOK.md for the full write-up:
+
+1. A DH split "FTL + Milkrun" (bulk demand on a dedicated truck, residual on
+   a shared route) now gets ONE cutoff, not two independent ones -- the FTL
+   route is synced to its Milkrun route's chosen departure time rather than
+   scheduled as an unrelated truck (see `linked_ftl` in
+   schedule_docks_and_compute_speed).
+
+2. The whole model now treats time as a repeating 24h cycle, not an
+   unbounded line. This network runs the SAME schedule every single day --
+   a "TMS" is a recurring daily clock value, not a one-time absolute instant
+   days out. Two symptoms of the old (wrong) linear framing are fixed by
+   this reframing together, not separately:
+     - A route made up entirely of low-Top266 (rollover-relaxed) DHs used to
+       drift its "ideal" TMS out past 24h (sometimes 48h+), since nothing
+       constrained it and the objective had no Top266 volume to score there.
+       The anchor is now computed against each DH's TRUE, un-relaxed deadline
+       (d1_true_threshold) and folded into a real single-day clock value via
+       modulo -- see `true_attr` below.
+     - Two routes near opposite sides of midnight (e.g. 23:00 and 01:00)
+       used to be invisible to each other's dock-capacity check, because an
+       unbounded linear timeline doesn't know they're only ~2 real clock
+       hours apart on a schedule that repeats forever. Dock-capacity windows
+       are now reduced circularly (`_circular_windows`) against one fixed
+       daily grid, so a window straddling midnight is correctly checked
+       against whatever sits right after it.
 """
 from __future__ import annotations
 
@@ -73,34 +101,45 @@ def _route_stop_offsets(
     return offsets
 
 
-def _cx_cutoff_hour(t_minutes: float, is_multi_dh: bool, cfg: dict[str, Any]) -> Optional[float]:
-    """CX cutoff = TMS - (3h multi-DH / 2h single-DH) - 1h processing.
+_DAY_MIN = 1440.0   # one repeating operational day, in minutes
 
-    Returns an hour-of-day (0-24) for the load-profile lookup (the profile is
-    a repeating daily pattern), EXCEPT when the cutoff has pushed a full day
-    or more past the reference midnight (cutoff_minutes >= 1440) -- in that
-    case returns None, signalling 100% capture. D1 means "delivered by the
-    day after the customer ordered"; if a full day-0 cycle has elapsed by the
-    cutoff, that day's order volume is certainly fully placed -- it should
-    NOT be treated as a fresh, barely-started day-1 cycle (wrapping via a
-    plain modulo would incorrectly reset capture to near-zero right after
-    midnight, which flips the economics: a route legitimately departing very
-    late overnight would look artificially empty instead of fully loaded)."""
+
+def _cx_cutoff_hour(t_minutes: float, is_multi_dh: bool, cfg: dict[str, Any]) -> float:
+    """CX cutoff = TMS - (3h multi-DH / 2h single-DH) - 1h processing, reduced
+    to an hour-of-day (0-24) for the load-profile lookup.
+
+    t_minutes is always a genuine daily-clock value in [0, _DAY_MIN) now (see
+    schedule_docks_and_compute_speed) -- the truck leaves at the SAME clock
+    time every single day, forever, so there is no "which calendar day"
+    ambiguity to special-case anymore. A cutoff that lands before midnight
+    (e.g. a truck leaving at 00:30 with a 4h buffer -> cutoff -3:30) simply
+    falls on the previous evening; Load Profile.csv is itself one repeating
+    daily curve, so a plain modulo is the correct, exact reduction here, not
+    an approximation -- the old clamp-at-both-ends logic was a symptom of
+    treating time as an unbounded line instead of a repeating cycle (see
+    PLAYBOOK.md's "daily-cycle dock scheduling" entry)."""
     buffer_hours = (
         cfg.get("cx_cutoff_multi_dh_hours", 3) if is_multi_dh else cfg.get("cx_cutoff_single_dh_hours", 2)
     ) + cfg.get("cx_cutoff_processing_hours", 1)
-    cutoff_minutes = t_minutes - buffer_hours * 60.0
-    # Clamp, don't wrap, on both sides -- a modulo would create the mirror-image
-    # artifact on the early side (preponing far enough to go negative would
-    # wrap to "late previous day" and get an undeserved high-capture bonus,
-    # exactly backwards: pushed that early, almost nothing has been ordered
-    # yet). >=1440 is the one deliberate exception (100%, per the D1 rule
-    # above); <0 has no such exception -- it's simply too early.
-    if cutoff_minutes >= 1440.0:
-        return None
-    if cutoff_minutes < 0.0:
-        return 0.0
+    cutoff_minutes = (t_minutes - buffer_hours * 60.0) % _DAY_MIN
     return cutoff_minutes / 60.0
+
+
+def _circular_windows(start: float, end: float, period: float = _DAY_MIN) -> list[tuple[float, float]]:
+    """Reduce an occupancy window [start, end) into 1-2 sub-intervals inside
+    [0, period), wrapping at midnight. The dock schedule repeats every single
+    day, so a window like 23:40-00:20 genuinely straddles the SAME recurring
+    dock slot on two consecutive calendar days -- both halves must land in
+    [0, period) for a fixed one-day grid to see them as adjacent to whatever
+    sits right after midnight, which is the whole point of this fix."""
+    length = end - start
+    if length >= period:
+        return [(0.0, period)]   # occupies the entire day -- shouldn't normally happen
+    a = start % period
+    b = a + length
+    if b <= period:
+        return [(a, b)]
+    return [(a, period), (0.0, b - period)]
 
 
 def schedule_docks_and_compute_speed(
@@ -137,6 +176,19 @@ def schedule_docks_and_compute_speed(
     d1_true_map = dict(zip(dh_rows[loc_col].astype(str), dh_rows["d1_true_threshold"]))
     shipments_map = dict(zip(dh_rows[loc_col].astype(str), dh_rows["total_shipments"]))
 
+    # Anchor the dock-scheduling "ideal" departure against each DH's TRUE,
+    # un-relaxed deadline (d1_true_threshold), never the rollover-relaxed
+    # time_window_end. Rollover exists to let ROUTE GENERATION (agent4.py)
+    # compose a route with a later TMS by sacrificing a low-priority DH's own
+    # same-day D1% -- it was never meant to give the physical TRUCK license
+    # to depart a calendar day late. d1_true_threshold is uniformly ~1800 min
+    # (the genuine "arrive by 6AM D+1" ceiling) for every DH regardless of
+    # rollover, so anchoring against it here keeps the legitimate up-to-30h
+    # overnight allowance while removing the +1440 rollover inflation that
+    # was making some routes' "ideal" TMS balloon to 3,000+ minutes.
+    true_attr = {dh: {**a, "time_window_end": d1_true_map.get(dh, a.get("time_window_end"))}
+                 for dh, a in attr.items()}
+
     dock_productivity = float(cfg.get("dock_productivity_per_hour", 100))
     transition_buffer = float(cfg.get("dock_transition_buffer_min", 30))
     granularity = max(float(cfg.get("dock_time_granularity_min", 10)), 1.0)
@@ -153,20 +205,67 @@ def schedule_docks_and_compute_speed(
             "n_docks_committed": n_docks_committed,
         }}
 
+    # DH -> its Milkrun route index, if any. Used to link a DH's dedicated
+    # FTL truck(s) to the SAME departure as its Milkrun route (a DH split
+    # "FTL + Milkrun" is one customer cutoff, not two independent ones).
+    dh_to_mr_idx: dict[str, int] = {}
+    for idx, row in routes.iterrows():
+        if row.get("Route_Type") == "Milkrun":
+            for dh in row["hubs"]:
+                dh_to_mr_idx[dh] = idx
+
     route_info: list[dict[str, Any]] = []
+    linked_ftl: list[dict[str, Any]] = []   # FTL routes synced to a Milkrun anchor -- no own decision variable
     for idx, row in routes.iterrows():
         hubs = list(row["hubs"])
+        is_ftl = row.get("Route_Type") != "Milkrun"
+
+        if is_ftl and len(hubs) == 1 and hubs[0] in dh_to_mr_idx:
+            dh = hubs[0]
+            offsets = _route_stop_offsets(row["route_sequence"], attr, dist_dict, latlong, mh_cfg.service_time_min)
+            shipments = shipments_map.get(dh, 0)
+            duration = (shipments / dock_productivity) * 60.0 if dock_productivity > 0 else 0.0
+            linked_ftl.append({
+                "idx": idx, "hubs": hubs, "anchor_idx": dh_to_mr_idx[dh],
+                "offsets": offsets, "duration": duration,
+            })
+            continue
+
         is_multi = len(hubs) > 1
-        tms0 = fd._compute_shifted_mh_dep(row["route_sequence"], attr, dist_dict, latlong, mh_cfg.service_time_min)
+        # Ideal TMS, anchored against TRUE deadlines, then folded into a
+        # genuine single daily clock value -- the truck departs at the same
+        # clock time every day forever, so there is no "day 2" for it to
+        # legitimately drift into (Issue 2 fix).
+        tms0_raw = fd._compute_shifted_mh_dep(row["route_sequence"], true_attr, dist_dict, latlong, mh_cfg.service_time_min)
+        tms0 = tms0_raw % _DAY_MIN
         offsets = _route_stop_offsets(row["route_sequence"], attr, dist_dict, latlong, mh_cfg.service_time_min)
         shipments = sum(shipments_map.get(dh, 0) for dh in hubs)
         duration = (shipments / dock_productivity) * 60.0 if dock_productivity > 0 else 0.0
-        floor = tms0 - search_window_hours * 60.0
-        n_steps = int((tms0 - floor) / granularity) + 1
-        candidates = [tms0 - k * granularity for k in range(n_steps)]
+
+        # Candidate departure times, preponing from tms0 within the day --
+        # capped at one full lap of the clock so modulo can't retread ground.
+        # Track each candidate's prepone STEP k (not just its raw clock value)
+        # so the tie-break below can prefer "closest to the natural ideal",
+        # never "numerically largest t" -- those stop being the same thing
+        # once preponing can wrap past midnight (a candidate reached by
+        # preponing deep into "the previous evening" can have a large raw t,
+        # e.g. 23:50, while still representing a big step away from ideal).
+        max_steps = min(int(search_window_hours * 60.0 / granularity) + 1, int(_DAY_MIN / granularity))
+        seen: set[float] = set()
+        candidates: list[float] = []
+        step_of: dict[float, int] = {}
+        for k in range(max_steps):
+            c = (tms0 - k * granularity) % _DAY_MIN
+            key = round(c, 6)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(c)
+                step_of[c] = k
+
         route_info.append({
             "idx": idx, "hubs": hubs, "is_multi": is_multi, "tms0": tms0,
             "offsets": offsets, "duration": duration, "candidates": candidates,
+            "step_of": step_of,
         })
 
     # Precompute speed_value[t] per route/candidate -- weighted Top266
@@ -175,7 +274,7 @@ def schedule_docks_and_compute_speed(
         r["speed_value"] = {}
         for t in r["candidates"]:
             cutoff_hour = _cx_cutoff_hour(t, r["is_multi"], cfg)
-            capture_fraction = 1.0 if cutoff_hour is None else load_profile_interp(cutoff_hour)
+            capture_fraction = load_profile_interp(cutoff_hour)
             val = 0.0
             for dh in r["hubs"]:
                 arrival = t + r["offsets"].get(dh, 0.0)
@@ -189,27 +288,38 @@ def schedule_docks_and_compute_speed(
         for t in r["candidates"]:
             x[(r["idx"], t)] = LpVariable(f"x_{r['idx']}_{round(t, 2)}".replace(".", "_").replace("-", "n"), cat=LpBinary)
 
-    # Tiny tie-break favoring later TMS among objective-tied candidates
-    # (matches "push as late as feasible" everywhere else in this engine --
-    # e.g. capture_fraction plateaus at 1.0 across a whole range once the
-    # cutoff crosses past-midnight, so without this the solver may pick any
-    # tied-optimal time, not necessarily the latest one). Scaled small enough
-    # to never override the primary speed objective.
+    # Tiny tie-break favoring the SMALLEST prepone step among objective-tied
+    # candidates -- i.e. stay as close to the natural (ideal) TMS as
+    # possible, only preponing as far as dock contention actually forces
+    # (matches "push as late as feasible" everywhere else in this engine).
+    # This must be step k, not raw t: once preponing can wrap past midnight,
+    # a deep prepone can land on a numerically LARGE t (e.g. preponing 5.8h
+    # from 05:40 wraps to 23:50), so "prefer larger t" and "prefer less
+    # preponing" stop being the same thing -- rewarding raw t would silently
+    # reintroduce a milder version of the very drift-away-from-ideal bug
+    # this whole rework fixes. Scaled small enough to never override the
+    # primary speed objective.
     tie_break_eps = 1e-3
     prob += (
         lpSum(x[(r["idx"], t)] * r["speed_value"][t] for r in route_info for t in r["candidates"])
-        + tie_break_eps * lpSum(x[(r["idx"], t)] * t for r in route_info for t in r["candidates"])
+        - tie_break_eps * lpSum(x[(r["idx"], t)] * r["step_of"][t] for r in route_info for t in r["candidates"])
     )
 
     for r in route_info:
         prob += lpSum(x[(r["idx"], t)] for t in r["candidates"]) == 1
 
-    # Dock capacity: at every grid point, at most n_docks_committed routes'
-    # occupancy windows [t - duration, t + transition_buffer] may be active.
-    grid_start = min(min(r["candidates"]) for r in route_info) - transition_buffer
-    grid_end = max(r["tms0"] for r in route_info) + transition_buffer
-    n_grid = int((grid_end - grid_start) / granularity) + 1
-    grid_points = [grid_start + k * granularity for k in range(n_grid)]
+    # Dock capacity: at every grid point (one fixed daily cycle, [0, 1440)),
+    # at most n_docks_committed occupancy windows may be active. Windows are
+    # reduced circularly (_circular_windows) so a window straddling midnight
+    # is correctly seen as adjacent to whatever sits right after it, instead
+    # of being invisible to a route on the "other side" of midnight (Issue 2).
+    # Linked FTL routes contribute their OWN occupancy window at their
+    # anchor Milkrun route's chosen time -- reusing that same x variable
+    # (never a new one), so choosing a time for the Milkrun route correctly
+    # consumes 2 physical docks at once if both windows overlap a grid point.
+    route_by_idx = {r["idx"]: r for r in route_info}
+    n_grid = int(_DAY_MIN / granularity)
+    grid_points = [k * granularity for k in range(n_grid)]
 
     for tau in grid_points:
         covering = []
@@ -217,8 +327,19 @@ def schedule_docks_and_compute_speed(
             for t in r["candidates"]:
                 window_start = t - r["duration"]
                 window_end = t + transition_buffer
-                if window_start <= tau <= window_end:
-                    covering.append(x[(r["idx"], t)])
+                for a, b in _circular_windows(window_start, window_end):
+                    if a <= tau < b:
+                        covering.append(x[(r["idx"], t)])
+                        break
+        for lf in linked_ftl:
+            anchor = route_by_idx[lf["anchor_idx"]]
+            for t in anchor["candidates"]:
+                window_start = t - lf["duration"]
+                window_end = t + transition_buffer
+                for a, b in _circular_windows(window_start, window_end):
+                    if a <= tau < b:
+                        covering.append(x[(anchor["idx"], t)])
+                        break
         if covering:
             prob += lpSum(covering) <= n_docks_committed
 
@@ -229,8 +350,9 @@ def schedule_docks_and_compute_speed(
             "status": "failed",
             "issues": [{
                 "type": "dock_schedule_infeasible",
-                "detail": f"{mh_name}: could not schedule all {len(route_info)} routes within "
-                          f"{n_docks_committed} committed docks even preponed up to {search_window_hours}h. "
+                "detail": f"{mh_name}: could not schedule all {len(route_info)} routes (+{len(linked_ftl)} "
+                          f"FTL synced to a Milkrun DH) within {n_docks_committed} committed docks even "
+                          f"preponed up to {search_window_hours}h within the day. "
                           f"Needs more docks, fewer/shorter routes, or a wider search window.",
             }],
             "data": None,
@@ -238,25 +360,28 @@ def schedule_docks_and_compute_speed(
 
     schedule_rows, dh_speed_rows, route_speed_rows = [], [], []
     mh_weighted_num = mh_weighted_den = 0.0
+    anchor_chosen_t: dict[int, float] = {}
 
     for r in route_info:
         chosen_t = next(t for t in r["candidates"] if x[(r["idx"], t)].varValue and x[(r["idx"], t)].varValue > 0.5)
+        anchor_chosen_t[r["idx"]] = chosen_t
         row = routes.loc[r["idx"]].to_dict()
         row["TMS"] = round(chosen_t, 2)
         row["Placement_Time"] = round(chosen_t - r["duration"], 2)
         schedule_rows.append(row)
 
         cutoff_hour = _cx_cutoff_hour(chosen_t, r["is_multi"], cfg)
-        capture_fraction = 1.0 if cutoff_hour is None else load_profile_interp(cutoff_hour)
+        capture_fraction = load_profile_interp(cutoff_hour)
         route_top266_total = sum(top266_map.get(dh, 0.0) for dh in r["hubs"])
         route_speed_value = r["speed_value"][chosen_t]
         route_speed_rows.append({
             "MH": mh_name, "Route_ID": r["idx"] + 1, "TMS": round(chosen_t, 2),
             "Ideal_TMS": round(r["tms0"], 2),
-            "CX_Cutoff_Hour": round(cutoff_hour, 2) if cutoff_hour is not None else "past-midnight (100%)",
+            "CX_Cutoff_Hour": round(cutoff_hour, 2),
             "Capture_Fraction": round(capture_fraction, 3), "Top266_Total": route_top266_total,
             "Top266_Speed_Value": round(route_speed_value, 2),
             "Route_Speed_Pct": round(route_speed_value / route_top266_total * 100, 1) if route_top266_total else None,
+            "Synced_To_Route_ID": None,
         })
 
         for dh in r["hubs"]:
@@ -272,6 +397,31 @@ def schedule_docks_and_compute_speed(
             })
             mh_weighted_num += top266 * (capture_fraction if passed else 0.0)
             mh_weighted_den += top266
+
+    # Linked FTL routes: reported for visibility (Dock_Schedule.csv/
+    # Route_Speed.csv), synced to their anchor Milkrun route's chosen time
+    # (Issue 1 fix). Deliberately NOT added to dh_speed_rows/mh_weighted_*:
+    # their DH's Top266 volume is already scored once via the anchor
+    # Milkrun route above -- adding it again here would double-count the
+    # same DH's speed contribution across two trucks that now share one
+    # cutoff by design.
+    for lf in linked_ftl:
+        chosen_t = anchor_chosen_t[lf["anchor_idx"]]
+        row = routes.loc[lf["idx"]].to_dict()
+        row["TMS"] = round(chosen_t, 2)
+        row["Placement_Time"] = round(chosen_t - lf["duration"], 2)
+        schedule_rows.append(row)
+
+        cutoff_hour = _cx_cutoff_hour(chosen_t, False, cfg)   # FTL dedicated = single-DH cutoff
+        capture_fraction = load_profile_interp(cutoff_hour)
+        route_speed_rows.append({
+            "MH": mh_name, "Route_ID": lf["idx"] + 1, "TMS": round(chosen_t, 2),
+            "Ideal_TMS": round(chosen_t, 2),   # no independent ideal -- always synced to the anchor
+            "CX_Cutoff_Hour": round(cutoff_hour, 2),
+            "Capture_Fraction": round(capture_fraction, 3), "Top266_Total": 0.0,
+            "Top266_Speed_Value": 0.0, "Route_Speed_Pct": None,
+            "Synced_To_Route_ID": lf["anchor_idx"] + 1,
+        })
 
     mh_speed_pct = round(mh_weighted_num / mh_weighted_den * 100, 1) if mh_weighted_den else None
 
@@ -320,32 +470,47 @@ def _speed_status(pct: Optional[float]) -> tuple[str, str]:
     return "critical", "Missed (< 50%)"
 
 
-def _assign_dock_rows(routes: list[dict[str, Any]]) -> dict[str, int]:
-    """Greedy earliest-finish-time interval partitioning -- assigns each route
-    a 0-based display dock-row for the timeline chart.
+def _routes_circular_overlap(
+    a: dict[str, Any], b: dict[str, Any], period: float = _DAY_MIN,
+) -> bool:
+    """True when two routes' dock-occupancy windows share any minute on the
+    repeating daily clock. Uses the same _circular_windows reduction as the ILP."""
+    for a0, a1 in _circular_windows(a["start"], a["end"], period):
+        for b0, b1 in _circular_windows(b["start"], b["end"], period):
+            if max(a0, b0) < min(a1, b1):
+                return True
+    return False
 
-    This is a VISUALIZATION construct only, not the ILP's own decision: the
-    dock-scheduling model enforces a capacity *count* at every time point, it
-    never assigns a specific dock identity to a route. Interval graphs are
-    perfect graphs, so the minimum number of rows this greedy assignment needs
-    always equals the true maximum concurrent overlap -- which the ILP's own
-    capacity constraint already guarantees is <= n_docks_committed. So this
-    never needs to invent extra rows beyond what schedule_docks_and_compute_speed
-    already certified as feasible."""
-    order = sorted(routes, key=lambda r: r["start"])
-    dock_free_at: list[float] = []
+
+def _dock_viz_segments(start: float, end: float, period: float = _DAY_MIN) -> list[dict[str, float]]:
+    """Reduce a raw Placement_Time→end window to 1-2 chart segments in [0, period)."""
+    return [{"start": a, "end": b} for a, b in _circular_windows(start, end, period)]
+
+
+def _assign_dock_rows(routes: list[dict[str, Any]]) -> dict[str, int]:
+    """Greedy interval partitioning on the repeating daily clock -- assigns each
+    route a 0-based display dock-row for the timeline chart.
+
+    This is a VISUALIZATION construct only, not the ILP's own decision. Overlap
+    is checked circularly (midnight wrap) so two routes that only clash across
+    midnight are not placed on the same lane."""
+    order = sorted(
+        routes,
+        key=lambda r: (min(s["start"] for s in r["segments"]), r["route_key"]),
+    )
+    rows: list[list[dict[str, Any]]] = []
     assignment: dict[str, int] = {}
     for r in order:
         placed = False
-        for row_idx, free_at in enumerate(dock_free_at):
-            if free_at <= r["start"]:
+        for row_idx, row_routes in enumerate(rows):
+            if not any(_routes_circular_overlap(r, other) for other in row_routes):
+                row_routes.append(r)
                 assignment[r["route_key"]] = row_idx
-                dock_free_at[row_idx] = r["end"]
                 placed = True
                 break
         if not placed:
-            assignment[r["route_key"]] = len(dock_free_at)
-            dock_free_at.append(r["end"])
+            assignment[r["route_key"]] = len(rows)
+            rows.append([r])
     return assignment
 
 
@@ -398,10 +563,14 @@ def build_dock_utilization_data(
                 except (ValueError, SyntaxError):
                     hubs = [hubs]
 
+            segments = _dock_viz_segments(placement, end)
             routes.append({
                 "route_key":  f"{mh_name}__{route_id}",
                 "route_id":   int(route_id) if pd.notna(route_id) else None,
                 "start": placement, "end": end, "tms": tms, "ideal_tms": ideal_tms,
+                "ideal_tms_clock": ideal_tms % _DAY_MIN,
+                "segments": segments,
+                "wraps_midnight": len(segments) > 1,
                 "shifted": abs(tms - ideal_tms) > 0.01,
                 "route_type": row.get("Route_Type", "Milkrun"),
                 "hubs": list(hubs), "n_stops": len(hubs),
@@ -429,8 +598,6 @@ def build_dock_utilization_data(
 
         n_committed = max(1, round(n_total - n_total * adhoc_reserve_pct)) if n_total else n_used
         n_reserved = (n_total - n_committed) if n_total else 0
-        window_start = min((r["start"] for r in routes), default=0.0)
-        window_end = max((r["end"] for r in routes), default=1440.0)
 
         mhs[mh_name] = {
             "n_docks_total":     n_total,
@@ -440,8 +607,8 @@ def build_dock_utilization_data(
             "n_routes":          len(routes),
             "n_shifted":         sum(1 for r in routes if r["shifted"]),
             "routes":            routes,
-            "window_start":      window_start,
-            "window_end":        window_end,
+            "window_start":      0.0,
+            "window_end":        _DAY_MIN,
         }
 
     return {"mhs": mhs}
@@ -650,7 +817,9 @@ function buildChart() {{
   const nRows = Math.max(d.n_docks_committed, d.n_docks_used, 1);
   const nReservedRows = d.n_docks_reserved || 0;
   const totalRows = nRows + nReservedRows;
-  const chartW = Math.max(600, (d.window_end - d.window_start) * PX_PER_MIN + 40);
+  const start = d.window_start;
+  const span = d.window_end - d.window_start;
+  const chartW = Math.max(600, span * PX_PER_MIN + 40);
   timeline.style.width = chartW + 'px';
   timeline.style.height = (totalRows * ROW_H) + 'px';
   axis.style.width = chartW + 'px';
@@ -670,32 +839,35 @@ function buildChart() {{
     document.getElementById('chart-wrap').appendChild(label);
   }}
 
-  const start = d.window_start;
   d.routes.forEach(r => {{
-    const bar = document.createElement('div');
-    bar.className = 'route-bar ' + (r.route_type === 'Milkrun' ? 'milkrun' : 'ftl');
-    bar.style.left = ((r.start - start) * PX_PER_MIN) + 'px';
-    bar.style.width = Math.max(6, (r.end - r.start) * PX_PER_MIN) + 'px';
-    bar.style.top = (r.dock_row * ROW_H + 3) + 'px';
-    bar.style.background = STATUS[r.status_key];
-    bar.textContent = 'R' + r.route_id + ' · ' + r.n_stops + ' stop' + (r.n_stops === 1 ? '' : 's');
-    bar.addEventListener('mouseenter', e => showTip(e, r));
-    bar.addEventListener('mousemove', e => moveTip(e));
-    bar.addEventListener('mouseleave', hideTip);
-    timeline.appendChild(bar);
+    const segs = r.segments && r.segments.length ? r.segments : [{{start: r.start, end: r.end}}];
+    segs.forEach((seg, segIdx) => {{
+      const bar = document.createElement('div');
+      bar.className = 'route-bar ' + (r.route_type === 'Milkrun' ? 'milkrun' : 'ftl');
+      bar.style.left = ((seg.start - start) * PX_PER_MIN) + 'px';
+      bar.style.width = Math.max(6, (seg.end - seg.start) * PX_PER_MIN) + 'px';
+      bar.style.top = (r.dock_row * ROW_H + 3) + 'px';
+      bar.style.background = STATUS[r.status_key];
+      const wrapHint = r.wraps_midnight && segs.length > 1 ? ' · wraps midnight' : '';
+      bar.textContent = 'R' + r.route_id + ' · ' + r.n_stops + ' stop' + (r.n_stops === 1 ? '' : 's') + wrapHint;
+      bar.addEventListener('mouseenter', e => showTip(e, r));
+      bar.addEventListener('mousemove', e => moveTip(e));
+      bar.addEventListener('mouseleave', hideTip);
+      timeline.appendChild(bar);
+    }});
 
     if (r.shifted) {{
       const mark = document.createElement('div');
       mark.className = 'shift-mark';
-      mark.style.left = ((r.ideal_tms - start) * PX_PER_MIN) + 'px';
+      const idealClock = r.ideal_tms_clock != null ? r.ideal_tms_clock : (r.ideal_tms % 1440);
+      mark.style.left = ((idealClock - start) * PX_PER_MIN) + 'px';
       mark.style.top = (r.dock_row * ROW_H) + 'px';
       timeline.appendChild(mark);
     }}
   }});
 
   const tickStep = 120;
-  const firstTick = Math.floor(start / tickStep) * tickStep;
-  for (let t = firstTick; t <= d.window_end; t += tickStep) {{
+  for (let t = start; t <= d.window_end; t += tickStep) {{
     const tick = document.createElement('div');
     tick.className = 'tick';
     tick.style.left = ((t - start) * PX_PER_MIN) + 'px';
@@ -887,3 +1059,41 @@ def run_dock_scheduling_for_all_mhs(
             "dock_utilization_json": viz_result["data"]["dock_utilization_json"],
         },
     }
+
+
+def _dock_viz_self_check() -> None:
+    """ponytail: smoke-test circular segment split + dock-row overlap detection."""
+    import pandas as pd
+
+    sched = pd.DataFrame([
+        {"MH": "T", "Route_ID": 1, "TMS": 30.0, "Placement_Time": -90.0,
+         "Route_Type": "Milkrun", "hubs": ["A"], "route_sequence": "x",
+         "assigned_vehicle_length": 14, "monthly_cost": 1, "Freq": 1},
+        {"MH": "T", "Route_ID": 2, "TMS": 1380.0, "Placement_Time": 1320.0,
+         "Route_Type": "Milkrun", "hubs": ["B"], "route_sequence": "y",
+         "assigned_vehicle_length": 14, "monthly_cost": 1, "Freq": 1},
+    ])
+    rs = pd.DataFrame([
+        {"MH": "T", "Route_ID": 1, "Route_Speed_Pct": 95.0, "Ideal_TMS": 30.0,
+         "Top266_Total": 1, "CX_Cutoff_Hour": 1.0, "Capture_Fraction": 0.8},
+        {"MH": "T", "Route_ID": 2, "Route_Speed_Pct": 88.0, "Ideal_TMS": 1380.0,
+         "Top266_Total": 1, "CX_Cutoff_Hour": 22.0, "Capture_Fraction": 0.7},
+    ])
+
+    class _Cfg:
+        n_docks = 2
+
+    data = build_dock_utilization_data(sched, rs, {"T": _Cfg()}, {"dock_transition_buffer_min": 30})
+    mh = data["mhs"]["T"]
+    r1, r2 = mh["routes"][0], mh["routes"][1]
+    assert mh["window_start"] == 0.0 and mh["window_end"] == _DAY_MIN
+    assert r1["wraps_midnight"] and len(r1["segments"]) == 2
+    assert r1["segments"] == [{"start": 1350.0, "end": 1440.0}, {"start": 0.0, "end": 60.0}]
+    assert r1["dock_row"] != r2["dock_row"], "circular overlap must land on different dock rows"
+    html = _build_dock_utilization_html(data)
+    assert "wraps midnight" in html and "r.segments" in html
+
+
+if __name__ == "__main__":
+    _dock_viz_self_check()
+    print("dock viz self-check ok")
