@@ -117,7 +117,15 @@ Step 4 — Phase 2 (optional, human-selected MH pairs only)
 Step 5 — Produce Final DH→MH List
   Input:   Checkpoint 2 accept/reject decisions
   Action:  Claude merges accepted Phase 2 changes back into dh_fc_mh_assignment.csv
+           MANDATORY, every time, no exceptions: also call
+           a3.build_updated_plan_volume(plan_vol_df, accepted_changes, pathway_df)
+           and overwrite plan_volume.csv with the result. Never skip this even if
+           the current task only cares about Agent 4 output — plan_volume.csv is
+           read by every future Agent 3 run, and skipping this step leaves it
+           silently stale (moved DHs still show their pre-Phase-2 path). See
+           AGENT3.md §8b for the exact rule and full sequence.
   Output:  final_dh_assignment.csv  (used as input to Agent 4)
+           plan_volume.csv          (rebuilt in place — see AGENT3.md §8b)
 
 Step 6 — Agent 4 Pre-flight
   Inputs:  dh_fc_mh_assignment.csv, DH Feasibility.csv, Lat Longs, MHDH rate card,
@@ -190,6 +198,8 @@ Also present:
 > "For each pair, accept or reject the Phase 2 changes. Accepted changes will be merged into the final DH assignment before Agent 4 runs."
 
 **Claude accepts per-pair decisions.** Partial acceptance (accept some pairs, reject others) is valid.
+
+**MANDATORY — the instant accept/reject resolves into a final `{DH_key: new_MH}` dict, before doing anything else:** call `a3.build_updated_plan_volume(plan_vol_df, accepted_changes, pathway_df)` and overwrite `plan_volume.csv` with the result (`r["data"]`). This runs every time Checkpoint 2 produces any accepted changes — never only when Agent 3 will be re-run again, never skipped because "this run only needs Agent 4." `dh_fc_mh_assignment.csv` already gets patched at this same moment (existing manual-merge pattern); `plan_volume.csv` must be kept in sync with it, or the two files silently disagree about network topology for every moved DH. Review `result["issues"]` before trusting the output — see AGENT3.md §8b for the full rule, the exact sequence, and the FBF-specific rebuild logic.
 
 ---
 

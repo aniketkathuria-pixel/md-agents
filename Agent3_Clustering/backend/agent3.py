@@ -2484,3 +2484,245 @@ def run_phase2(
             "data": None,
             "issues": [{"type": "phase2_error", "detail": traceback.format_exc()}],
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-Phase-2 plan_volume rebuild
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_updated_plan_volume(
+    plan_vol_df: pd.DataFrame,
+    accepted_changes: dict[str, str],
+    pathway_df: Optional[pd.DataFrame] = None,
+    route_lookup: Optional[dict[tuple[str, str], list[str]]] = None,
+) -> dict[str, Any]:
+    """
+    Rebuilds plan_volume.csv rows for DHs whose serving MH (DMH) changed via
+    an accepted Phase 2 move, so the file's own MH1..MHn path columns stay
+    consistent with the network topology Phase 2 actually costed.
+
+    Call this AFTER Checkpoint 2 (per-pair accept/reject) has resolved into a
+    final `accepted_changes` dict -- same {DH_key: new_DMH} format already
+    used by agent4.build_location_file's phase2_accepted_changes. This
+    function does not decide which moves are accepted; it only applies moves
+    already decided. Rows for DHs not in accepted_changes are returned
+    completely untouched.
+
+    Two different rebuild rules, matching compute_mhmh_cost's own resolution
+    logic exactly (same lookups, same fallback order -- this file is meant to
+    reproduce whatever cost Phase 2 already reported, not invent a new one):
+
+    NON-FBF rows (stream != "FBF" -- NFBF, Alite, PH sources): the row's own
+    MH1 (source) never changes. Its hop chain is tail-patched to end at the
+    new DMH via _resolve_smh_to_dmh (the same private helper compute_mhmh_cost
+    uses):
+      - route_lookup[(MH1, new_DMH)] found -> reuse that exact hop chain
+        verbatim (a route that demonstrably already exists elsewhere in the
+        network today). Path_Status = "verified".
+      - not found -> _resolve_smh_to_dmh's own fallback: append new_DMH onto
+        the END of the row's existing hops (i.e. old_MH1->...->old_DMH->
+        new_DMH). Path_Status = "estimated" -- this is not a guess invented
+        here, it is the exact fallback compute_mhmh_cost itself used when it
+        costed this same move, so the rebuilt file matches that number.
+
+    FBF rows (stream == "FBF"): DMH is by definition the DH's P1_MH, so a DMH
+    change means the DH's P1/P2 split itself changes -- not a tail-patch.
+    fbf_network_pathway_wide.csv is MH-keyed (not DH-keyed): it says, for any
+    MH acting as P1, who its P2 partner is and at what %. The DH's existing
+    FBF row(s) are dropped and replaced by exactly two new rows:
+      - P1 row: MH1 = new_DMH, hops = [new_DMH] (zero MH-MH hops -- P1
+        inventory is dispatched directly from the new serving MH).
+        Path_Status = "verified" (trivially -- there is no path to resolve).
+      - P2 row: MH1 = new_P2_MH (looked up from pathway_df by
+        P1_central_hub == new_DMH), hops = route_lookup[(new_P2_MH, new_DMH)]
+        if found (verified) else the direct 2-node edge [new_P2_MH, new_DMH]
+        (estimated) -- matching compute_mhmh_cost's own FBF P2-leg fallback.
+      Total FBF demand for the DH (summed across whatever FBF rows it had
+      before) is preserved and re-split by the NEW P1's P2_pct from
+      pathway_df -- not the DH's old split. Only median_demand_shipments,
+      peak_demand_shipments, plan_median_cft_volume, plan_peak_cft_volume,
+      and plan_returns_cft_volume are rescaled by the new P1/P2 shares; all
+      other columns (LMHub, source_type, stream, has_demand_data, the
+      per-stream *_fbf/*_alite/*_nfbf sub-split columns, etc.) are carried
+      forward unchanged from the DH's existing FBF row onto both new rows.
+
+    Known limitations (flagged via issues, not silently handled):
+      - "no_pathway_match": new_DMH has no P1_central_hub row in pathway_df,
+        or pathway_df/route not usable at all -- FBF rows for that DH are
+        left completely unchanged (old, now-stale P1/P2 split).
+      - "mixed_stream_fbf_caveat": a DH's FBF row(s) has has_mixed_streams
+        == True -- its median/peak/CFT totals may be blended across streams,
+        not purely FBF, so the re-split above may be approximate. The row is
+        still rebuilt (better a labeled approximation than stale data), but
+        the caveat is surfaced rather than silently trusted.
+      - "no_stream_column": plan_vol_df has no `stream` column at all (Phase 1
+        ran without MH1 tagging) -- every row for the DH is treated with the
+        non-FBF tail-patch rule, since FBF rows can't be identified.
+      - "schema_widened": a rebuilt hop chain needed more MHn columns than
+        plan_vol_df had -- new columns were added (NaN-filled for every
+        untouched row).
+      - "dh_not_found": a DH in accepted_changes has no rows in plan_vol_df at
+        all -- nothing to rebuild, flagged so the caller can investigate.
+
+    Every row this function returns carries a "Path_Status" column:
+    "unchanged" (row untouched), "verified" (route_lookup hit, or a trivial
+    zero-hop P1 row), or "estimated" (a fallback was used) -- so
+    verified/estimated coverage is visible at a glance without cross-
+    referencing issues.
+
+    Returns {"status": "ok"|"partial", "data": DataFrame, "issues": [...]}.
+    """
+    issues: list[dict] = []
+    df = plan_vol_df.copy()
+    df["Path_Status"] = "unchanged"
+
+    def _mh_col_num(c: str) -> int:
+        return int(re.match(r"^MH(\d+)$", str(c), re.I).group(1))
+
+    mh_cols = sorted((c for c in df.columns if re.match(r"^MH\d+$", str(c), re.I)), key=_mh_col_num)
+    dh_col = "LMHub" if "LMHub" in df.columns else next(
+        (c for c in df.columns if str(c).lower() == "lmhub"), None
+    )
+    if dh_col is None:
+        return {"status": "failed", "data": None,
+                "issues": [{"type": "missing_columns", "detail": "plan_vol_df missing LMHub"}]}
+
+    if route_lookup is None:
+        rl_result = build_route_lookup(df)
+        route_lookup = rl_result["data"]
+
+    # P1 -> (P2, P2_pct) index from the network pathway file (MH-keyed, not DH-keyed).
+    p1_pct_index: dict[str, tuple[str, float]] = {}
+    if pathway_df is not None and len(pathway_df) > 0:
+        p1c = next((c for c in pathway_df.columns if "p1" in str(c).lower() and "central" in str(c).lower()), None)
+        p2c = next((c for c in pathway_df.columns if "p2" in str(c).lower() and "central" in str(c).lower()), None)
+        p2pct = next((c for c in pathway_df.columns if "p2" in str(c).lower() and "pct" in str(c).lower()), None)
+        if p1c:
+            for p1_key, row_idx in _build_pathway_p1_index(pathway_df, p1c).items():
+                pr = pathway_df.loc[row_idx]
+                p2_hub = _pathway_mh_key(pr[p2c]) if p2c and p2c in pr.index else ""
+                p2_pct = (
+                    _parse_pct(pr[p2pct])
+                    if p2_hub and p2pct and p2pct in pr.index and _is_real_central_hub(pr[p2c])
+                    else 0.0
+                )
+                p1_pct_index[p1_key] = (p2_hub, p2_pct)
+
+    def _widen_mh_cols(n: int) -> None:
+        nonlocal mh_cols
+        have = {_mh_col_num(c) for c in mh_cols}
+        added = False
+        for k in range(1, n + 1):
+            if k not in have:
+                df[f"MH{k}"] = np.nan
+                added = True
+        if added:
+            mh_cols = sorted((c for c in df.columns if re.match(r"^MH\d+$", str(c), re.I)), key=_mh_col_num)
+            issues.append({"type": "schema_widened",
+                           "detail": f"Added MH columns up to MH{n} to fit a longer rebuilt path"})
+
+    def _write_hops(row_idx: Any, hops: list[str]) -> None:
+        """hops ends at DMH (does not include the DH itself)."""
+        _widen_mh_cols(len(hops))
+        for i, col in enumerate(mh_cols):
+            df.at[row_idx, col] = hops[i] if i < len(hops) else np.nan
+        df.at[row_idx, "last_mh"] = hops[-1]
+        df.at[row_idx, "second_last_mh"] = hops[-2] if len(hops) >= 3 else np.nan
+        df.at[row_idx, "DMH"] = hops[-1]
+        # +1 to include the DH itself, matching parse_resort's hop_count convention
+        df.at[row_idx, "hop_count"] = len(hops) + 1
+
+    has_stream_col = "stream" in df.columns
+    if not has_stream_col and accepted_changes:
+        issues.append({"type": "no_stream_column",
+                       "detail": "plan_vol_df has no stream column -- FBF rows cannot be identified; "
+                                 "all rows treated with the non-FBF tail-patch rule"})
+
+    for dh_key, new_mh in accepted_changes.items():
+        dh_norm = _norm_hub_key(dh_key)
+        new_dmh = _norm_hub_key(new_mh)
+        row_mask = df[dh_col].map(_norm_hub_key) == dh_norm
+        if not row_mask.any():
+            issues.append({"type": "dh_not_found", "detail": f"{dh_key} has no rows in plan_vol_df"})
+            continue
+
+        if has_stream_col:
+            fbf_mask = row_mask & (df["stream"].astype(str).str.strip().str.upper() == "FBF")
+        else:
+            fbf_mask = pd.Series(False, index=df.index)
+        non_fbf_idx = list(df.loc[row_mask & ~fbf_mask].index)
+        fbf_idx = list(df.loc[fbf_mask].index)
+
+        # --- Non-FBF rows: tail-patch, matching _resolve_smh_to_dmh exactly ---
+        for idx in non_fbf_idx:
+            row = df.loc[idx]
+            hops = _extract_hops_from_plan_row(row, mh_cols)
+            if not hops:
+                issues.append({"type": "no_hops_for_row", "detail": f"{dh_key} row {idx} has no MH1..DMH hops"})
+                continue
+            smh_key, old_dmh = hops[0], hops[-1]
+            if old_dmh == new_dmh:
+                continue  # already serving from the new DMH -- nothing to change
+            found = (smh_key, new_dmh) in route_lookup
+            new_hops = _resolve_smh_to_dmh(smh_key, old_dmh, new_dmh, hops, route_lookup)
+            _write_hops(idx, new_hops)
+            df.at[idx, "Path_Status"] = "verified" if found else "estimated"
+
+        # --- FBF rows: full P1/P2 replace, not a tail-patch ---
+        if fbf_idx:
+            if new_dmh not in p1_pct_index:
+                issues.append({"type": "no_pathway_match",
+                               "detail": f"{dh_key}: no pathway row for P1_central_hub={new_dmh} "
+                                         "-- FBF rows left unchanged"})
+                continue
+
+            fbf_rows = df.loc[fbf_idx]
+            if "has_mixed_streams" in df.columns and fbf_rows["has_mixed_streams"].fillna(False).any():
+                issues.append({"type": "mixed_stream_fbf_caveat",
+                               "detail": f"{dh_key}: FBF row(s) flagged has_mixed_streams -- "
+                                         "median/peak/CFT totals may be blended across streams"})
+
+            new_p2, p2_pct = p1_pct_index[new_dmh]
+
+            def _sum_col(col: str) -> float:
+                return float(pd.to_numeric(fbf_rows.get(col, 0), errors="coerce").fillna(0).sum())
+
+            totals = {
+                "median_demand_shipments": _sum_col("median_demand_shipments"),
+                "peak_demand_shipments":   _sum_col("peak_demand_shipments"),
+            }
+            for c in ("plan_median_cft_volume", "plan_peak_cft_volume", "plan_returns_cft_volume"):
+                if c in df.columns:
+                    totals[c] = _sum_col(c)
+
+            template = fbf_rows.iloc[0].to_dict()
+            df = df.drop(index=fbf_idx)
+
+            legs = [(1.0 - p2_pct, new_dmh, None)]
+            if new_p2 and p2_pct > 0.0:
+                legs.append((p2_pct, new_p2, new_dmh))
+
+            for share, mh1_key, hop_target in legs:
+                if share <= 0.0:
+                    continue
+                r = dict(template)
+                r["MH1"] = mh1_key
+                for c in mh_cols:
+                    if c != "MH1":
+                        r[c] = np.nan
+                for col, total in totals.items():
+                    r[col] = total * share
+
+                new_idx = (df.index.max() + 1) if len(df) else 0
+                df.loc[new_idx] = r
+                if hop_target is None:
+                    _write_hops(new_idx, [mh1_key])
+                    df.at[new_idx, "Path_Status"] = "verified"
+                else:
+                    found = (mh1_key, hop_target) in route_lookup
+                    hops = route_lookup.get((mh1_key, hop_target)) or [mh1_key, hop_target]
+                    _write_hops(new_idx, hops)
+                    df.at[new_idx, "Path_Status"] = "verified" if found else "estimated"
+
+    status = "partial" if issues else "ok"
+    return {"status": status, "data": df.reset_index(drop=True), "issues": issues}

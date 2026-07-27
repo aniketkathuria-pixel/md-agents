@@ -36,6 +36,7 @@ Agent 3 answers a single question for every Destination Hub (DH) in the network:
 | `build_smh_mhlast_report` | `plan_vol_df`; `cost_lookup`; `cfg`; optionally `dist_lookup`, `hub_lat_lkp` | `plan_vol_df`: `MH1`…`MHn`, `plan_median_cft_volume`, `median_demand_shipments`; optionally `source_type` (controls PH/ALITE zero-first logic) |
 | `run_agent3` | All 8 DataFrames + `cfg` + `output_dir` | See individual function requirements above; `fc_mh_df` accepted as raw Plan fbf master (`MH1`+`Tag`) or pre-processed; `lat_long_df` accepted as raw (`Site_name`+`Latitude`+`Longitude`) or pre-processed |
 | `run_phase2` | `agent3_output_dir: Path`; `approved_mh_pairs: list[tuple[str,str]]`; `plan_vol_df`, `dist_df`, `cost_df`, `mhdh_rate_card_df`, `location_file_df`, `lat_long_df`, `h2h_df` DataFrames; `cfg`; `output_dir`; `agent4_backend_path: Path` | `agent3_output_dir` must contain `dh_fc_mh_assignment.csv` and `smh_mhlast_cost_per_shipment.csv`; `agent4_backend_path` must be a directory containing `agent4_pipeline.py` |
+| `build_updated_plan_volume` | `plan_vol_df: DataFrame`; `accepted_changes: dict[str,str]` (`{DH_key: new_DMH}`); optionally `pathway_df`, `route_lookup` | `plan_vol_df` must have `LMHub` and `MH1`…`MHn` columns; `pathway_df` required to correctly rebuild any accepted DH whose `stream == "FBF"` — without it those DHs' FBF rows are left unchanged and flagged `no_pathway_match`. **Mandatory: call this every time, immediately after Checkpoint 2 resolves** — see §8b. |
 
 ---
 
@@ -253,6 +254,52 @@ Returns `{"status": "ok"|"partial"|"failed", "data": {"excel_paths": [...], "sum
 
 ---
 
+### `build_updated_plan_volume`
+```python
+build_updated_plan_volume(
+    plan_vol_df: pd.DataFrame,
+    accepted_changes: dict[str, str],       # {DH_key: new_DMH} -- final, human-accepted moves only
+    pathway_df: Optional[pd.DataFrame] = None,
+    route_lookup: Optional[dict[tuple[str, str], list[str]]] = None,
+) -> dict[str, Any]
+```
+Returns `{"status": "ok"|"partial", "data": DataFrame, "issues": [...]}`.
+
+**⚠ MANDATORY — call this every time, immediately after Checkpoint 2 resolves.** Never skip it, even if the user only cares about cost/Agent 4 output for this run — `plan_volume.csv` is Agent 1's own output and an input to every *future* Agent 3 run; if it isn't rebuilt, the next run will silently re-cost every moved DH against its stale, pre-Phase-2 path. See §8b for exactly where this sits in the checkpoint flow.
+
+Rebuilds `plan_volume.csv` rows for DHs whose serving MH (DMH) changed via an accepted Phase 2 move, so the file's own `MH1..MHn` path columns stay consistent with the network topology Phase 2 actually costed. Does **not** decide which moves are accepted — `accepted_changes` must already be the final, human-approved dict (same `{DH_key: new_MH}` shape as `agent4.build_location_file`'s `phase2_accepted_changes`). Rows for DHs not in `accepted_changes` are returned completely untouched.
+
+Reuses Agent 3's own cost-resolution logic exactly (`build_route_lookup`, `_resolve_smh_to_dmh`) — the rebuilt path always matches whatever cost Phase 2 already reported, rather than inventing a new number.
+
+**Two different rebuild rules, by stream:**
+
+- **Non-FBF rows** (NFBF / Alite / PH sources) — `MH1` (source) never changes; only the tail of the hop chain is patched to end at the new DMH:
+  - `route_lookup[(MH1, new_DMH)]` found → reuse that exact chain verbatim (a route that already exists elsewhere in the network today). `Path_Status = "verified"`.
+  - Not found → fall back to appending `new_DMH` onto the *end* of the row's existing hops (`old_MH1 → ... → old_DMH → new_DMH`) — the same fallback `compute_mhmh_cost` itself uses. `Path_Status = "estimated"`.
+- **FBF rows** — DMH ≡ P1_MH by definition for FBF, so a DMH change means the DH's P1/P2 split itself changes, not a tail-patch. The DH's existing FBF row(s) are dropped and replaced with exactly two new rows, using `fbf_network_pathway_wide.csv` (MH-keyed, not DH-keyed — it says "if MH X is P1, MH Y is always its P2 partner, at Z%"):
+  - **P1 row:** `MH1 = new_DMH`, hops = `[new_DMH]` (zero MH-MH hops — P1 inventory dispatches directly). `Path_Status = "verified"` (trivially — nothing to resolve).
+  - **P2 row:** `MH1 = new_P2_MH` (looked up via `pathway_df[P1_central_hub == new_DMH]`), hops = `route_lookup[(new_P2_MH, new_DMH)]` if found (verified) else the direct 2-node edge (estimated) — matching `compute_mhmh_cost`'s own FBF P2-leg fallback.
+  - Total FBF demand for the DH (summed across whatever FBF rows it had) is preserved and **re-split by the NEW P1's P2_pct** — not the DH's old split. Only `median_demand_shipments`, `peak_demand_shipments`, `plan_median_cft_volume`, `plan_peak_cft_volume`, `plan_returns_cft_volume` are rescaled; every other column is carried forward unchanged from the DH's existing FBF row.
+
+**Every row carries a `Path_Status` column:** `"unchanged"` (untouched), `"verified"` (route_lookup hit, or a trivial zero-hop P1 row), or `"estimated"` (a fallback was used) — so verified/estimated coverage is visible at a glance, never silently guessed.
+
+**Issue types:** `no_pathway_match` (new DMH has no `P1_central_hub` row in `pathway_df` — that DH's FBF rows left unchanged), `mixed_stream_fbf_caveat` (DH's FBF row flagged `has_mixed_streams` — totals may be blended across streams, rebuilt anyway but flagged), `no_stream_column` (no `stream` column at all — every row treated with the non-FBF rule), `schema_widened` (a rebuilt chain needed more `MHn` columns than the file had — added, NaN-filled for untouched rows), `dh_not_found` (a DH in `accepted_changes` has no rows in `plan_vol_df`).
+
+```python
+# Called right after Checkpoint 2's accept/reject resolves into a final dict —
+# same accepted_changes dict already passed to agent4.build_location_file.
+r = a3.build_updated_plan_volume(
+    plan_vol_df=plan_vol_df,
+    accepted_changes=accepted_changes,   # {"SATELLITEHUB_PUNE1": "CENTRALHUB_L_MUMX", ...}
+    pathway_df=pathway_df,
+)
+if r["issues"]:
+    print("Review before trusting the rebuilt file:", r["issues"])
+save_dataframe(r["data"], agent1_out_dir / "plan_volume.csv")   # a1.save_dataframe, or plain to_csv
+```
+
+---
+
 ## 4. Composing Functions
 
 ### Full pipeline: load files → build lookups → run_agent3 → outputs
@@ -347,6 +394,17 @@ r2 = a3.run_phase2(
     output_dir=phase2_out,
     agent4_backend_path=Path(r"Agent4_Routing\backend"),
 )
+
+# 5. Present before/after per pair; user accepts/rejects (Checkpoint 2, see §8b)
+#    accepted_changes = {DH: new_MH, ...} built from only the ACCEPTED pairs
+
+# 6. MANDATORY, every time, immediately after step 5 resolves — never skip:
+r3 = a3.build_updated_plan_volume(
+    plan_vol_df=plan_vol_df,
+    accepted_changes=accepted_changes,
+    pathway_df=pathway_df,
+)
+save_dataframe(r3["data"], agent1_out_dir / "plan_volume.csv")
 ```
 
 ---
@@ -521,6 +579,28 @@ Each Agent 4 ILP call typically takes 1–10 seconds depending on pool size and 
 ### `agent4_backend_path`
 
 Always pass `Agent4_Routing\backend`. `run_phase2` inserts this path into `sys.path` at call time and imports `agent4_pipeline as p4`.
+
+---
+
+## 8b. MANDATORY — `build_updated_plan_volume` must run every time, right after Checkpoint 2
+
+`run_phase2` only *proposes* a pool assignment — it does not decide which pairs are actually adopted. That decision is Checkpoint 2 (PROJECT_CONTEXT.md §5): Claude presents before/after cost per pair, the user accepts or rejects **per pair**, and only then does a final, approved `{DH_key: new_MH}` dict exist.
+
+**The moment that dict exists — same moment it's already handed to `agent4.build_location_file(phase2_accepted_changes=...)` — it must *also* be handed to `build_updated_plan_volume`.** This is not optional and not conditional on what the user asked the run for. `plan_volume.csv` is Agent 1's own output and an input to every future Agent 3 Phase 1 run (via `build_route_lookup`, `compute_mhmh_cost`, etc.). If it is not rebuilt at this point:
+- The next Agent 3 run will silently cost every moved DH against its **stale, pre-Phase-2 path** — the exact same class of silent-understatement bug documented elsewhere in this codebase for ILP failures and missing-edge rate cards.
+- `plan_volume.csv` and `dh_fc_mh_assignment.csv` (the file that *does* get patched today per the existing manual-merge pattern) will disagree about the network topology for every moved DH.
+
+**Never fire this on the pool optimizer's own proposed assignment.** `run_phase2`'s `best`/`dhs_moved` per pair is a recommendation, exactly like Agent 3 Phase 1's `assigned_fc_mh` — it is not a decision until a human accepts it at Checkpoint 2. Passing an unapproved or partially-approved dict here would silently commit topology changes nobody signed off on.
+
+**Sequence, every time, no exceptions:**
+```
+run_phase2()  →  Checkpoint 2 (user accepts/rejects per pair)  →  build accepted_changes dict
+  →  build_updated_plan_volume(plan_vol_df, accepted_changes, pathway_df)   ← THIS STEP
+  →  save_dataframe(result["data"], .../plan_volume.csv)
+  →  (separately, existing pattern) merge accepted_changes into dh_fc_mh_assignment.csv
+  →  build_location_file(phase2_accepted_changes=accepted_changes)  →  Agent 4
+```
+Always review `result["issues"]` before trusting the rebuilt file — `no_pathway_match` and `mixed_stream_fbf_caveat` in particular mean a DH's FBF rows may still need a second look.
 
 ---
 
