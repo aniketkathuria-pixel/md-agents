@@ -72,6 +72,46 @@ Agentic tools\
 
 ---
 
+## 2a. Run output folders (orchestrator convention)
+
+**Rule:** All agent outputs live under that agent's `output\` folder. **Never write run outputs to `Inputs\`.** Never modify Agent 1's `plan_volume.csv` in place when Phase 2 accepts changes — write `plan_volume_updated.csv` to the Phase 2 subfolder instead (see AGENT3.md §8b).
+
+### Folder name format
+
+Every run gets its own folder, named by the orchestrator when the run starts:
+
+```
+Agent_{N}_{DDMMYY}_{HHMM}
+```
+
+| Part | Meaning | Example |
+|---|---|---|
+| `N` | Agent number (1, 3, or 4 — Agent 2 has no output folder) | `3` |
+| `DDMMYY` | Run date: day, month, two-digit year | `270726` = 27 Jul 2026 |
+| `HHMM` | Run start time, 24-hour clock | `1730` = 17:30 |
+
+**Examples:**
+- `Agent1_DataPrep\output\Agent_1_270726_1700\`
+- `Agent3_Clustering\output\Agent_3_270726_1730\`
+- `Agent4_Routing\output\Agent_4_270726_1830\`
+
+Use the machine's local time at run start. Record the folder path in `RUN_HISTORY.md`.
+
+### Agent 3 + Phase 2 nesting
+
+Phase 2 always runs against a **specific** Agent 3 Phase 1 folder. Its outputs go in a **child folder** inside that Agent 3 run folder:
+
+```
+Agent3_Clustering\output\Agent_3_{DDMMYY}_{HHMM}\          ← Phase 1 outputs
+Agent3_Clustering\output\Agent_3_{DDMMYY}_{HHMM}\Agent_3_phase2_{DDMMYY}_{HHMM}\   ← Phase 2 outputs
+```
+
+The Phase 2 folder name uses the same `Agent_3_phase2_{DDMMYY}_{HHMM}` pattern (Phase 2 start time, not Phase 1 time). It must contain at minimum: Phase 2 Excel workbooks, `plan_volume_updated.csv` (if any pair was accepted), and patched `dh_fc_mh_assignment_final.csv`.
+
+**Legacy folders** (`run_20260715`, `run_20260727`, etc.) pre-date this convention — treat them as historical only; new runs use `Agent_{N}_{DDMMYY}_{HHMM}`.
+
+---
+
 ## 3. Agent Roles
 
 | Agent | Role | Python File | MD Reference |
@@ -79,7 +119,8 @@ Agentic tools\
 | Agent 1 | Data prep — parse resort/plan files, compute CFT volumes, build per-DH aggregates | `Agent1_DataPrep\backend\agent1.py` | `Agent1_DataPrep\AGENT1.md` |
 | Agent 2 | Rates and distances — validate and load distance matrix and rate cards (no Python backend) | — | `Agent2_RatesDistances\AGENT2.md` |
 | Agent 3 | Clustering — assign DHs to FC_MHs by cost and D1%; run Phase 2 contested pair analysis | `Agent3_Clustering\backend\agent3.py` | `Agent3_Clustering\AGENT3.md` |
-| Agent 4 | Routing — ILP milkrun optimisation per MH; FTL pre-processing; OSRM distance lookup | `Agent4_Routing\backend\agent4.py` | `Agent4_Routing\AGENT4.md` |
+| Agent 4 | Freeze-day routing — optimal freeze day per MH, spillover/adhoc simulation, baseline comparison; then dock scheduling + Actual D1%/speed% | `Agent4_Routing\backend\agent4_freeze_day.py` + `agent4_dock_scheduling.py` | `Agent4_Routing\AGENT4.md` |
+| Phase 2 ILP | Subset routing cost evaluation during Phase 2 pair analysis | `Agent4_Routing\backend\agent4.py` (Phase 2 only) | `Agent3_Clustering\AGENT3.md` §9 |
 
 ---
 
@@ -116,40 +157,34 @@ Step 4 — Phase 2 (optional, human-selected MH pairs only)
 
 Step 5 — Produce Final DH→MH List
   Input:   Checkpoint 2 accept/reject decisions
-  Action:  Claude merges accepted Phase 2 changes back into dh_fc_mh_assignment.csv
-           MANDATORY, every time, no exceptions: also call
-           a3.build_updated_plan_volume(plan_vol_df, accepted_changes, pathway_df)
-           and overwrite plan_volume.csv with the result. Never skip this even if
-           the current task only cares about Agent 4 output — plan_volume.csv is
-           read by every future Agent 3 run, and skipping this step leaves it
-           silently stale (moved DHs still show their pre-Phase-2 path). See
-           AGENT3.md §8b for the exact rule and full sequence.
-  Output:  final_dh_assignment.csv  (used as input to Agent 4)
-           plan_volume.csv          (rebuilt in place — see AGENT3.md §8b)
+  Action:  Claude merges accepted Phase 2 changes into dh_fc_mh_assignment.csv (in the Agent 3 run folder)
+           MANDATORY: call build_updated_plan_volume and save as plan_volume_updated.csv
+           in the Phase 2 subfolder — never overwrite Agent 1's plan_volume.csv. See AGENT3.md §8b.
+  Output:  dh_fc_mh_assignment_final.csv  (Agent 3 run or Phase 2 folder)
+           plan_volume_updated.csv        (Phase 2 subfolder only)
 
 Step 6 — Agent 4 Pre-flight
-  Inputs:  dh_fc_mh_assignment.csv, DH Feasibility.csv, Lat Longs, MHDH rate card,
-           phase2_accepted_changes dict (from Checkpoint 2 — empty dict if Phase 2 skipped)
-  Actions: build_location_file(agent3_df, dh_feasibility_df,
-               phase2_accepted_changes={"DH_KEY": "NEW_MH", ...})
-                 → MH baseline is current_fc_mh (resort) for all DHs;
-                   only DHs in phase2_accepted_changes dict are overridden.
-                   assigned_fc_mh (Phase 1 proposal) is never used as the MH baseline.
-           preflight_check()     → validates all DHs have ML, lat/long, rate card entry
-  Output:  location_file.csv  (or list of blockers)
+  Inputs:  dh_fc_mh_assignment_final.csv (or assignment + phase2_accepted_changes),
+           dh_daywise_volume.csv (from Agent 1 with include_daywise=True),
+           H2H network file, DH Feasibility.csv, Lat Longs, MHDH rate card,
+           Distance Matrix, Load Profile.csv
+  Actions: build_freeze_day_location_file(agent3_df, feas_df, h2h_df, daywise_df, mh_configs, cfg,
+               phase2_accepted_changes={...})
+           preflight_check() on the base location columns → validates ML, rate card, distance matrix
+  Output:  freeze-day location DataFrame (or list of blockers)
 
   ─── CHECKPOINT 3 ─── (see §5)
 
-Step 7 — Agent 4: Milkrun Routing
-  Inputs:  location_file.csv, distance_df (or OSRM live), mhdh_rate_df, Load Profile
-  Outputs: Expanded_Schedule.csv    (all milkrun routes with stops, distances, costs)
-           Final_Assignment.csv     (DH → truck → MH final mapping)
-           DH_Route_Summary.csv     (per-DH: serving MH, truck, distance, cost, D1% flag)
-           Clustering_Output.csv    (bearing-cluster groupings per MH)
-           Filtered_Routes.csv      (ILP-selected routes before schedule expansion)
-           Absorbed_Residuals.csv   (DHs absorbed from FTL residuals into milkrun)
-           osrm_fallback_log.csv    (DHs where OSRM failed, haversine used instead)
-           validation_report_agent4.txt
+Step 7 — Agent 4: Freeze-Day Routing + Dock Scheduling (always both)
+  Step 7a — run_agent4_freeze_day_pipeline(location_df, dist_dict, latlong, mh_configs, out_dir, cfg)
+  Inputs:  freeze-day location file, distance matrix (OSRM fallback at runtime), lat/long, MHDH rate card
+  Outputs: Location_File.csv, Freeze_Day_Comparison.csv, Final_Assignment.csv, Expanded_Schedule.csv,
+           Baseline.csv, Baseline_vs_Optimal.csv, Network_Summary.csv, spillover/adhoc logs,
+           Route_Visualizer.html
+
+  Step 7b — run_dock_scheduling_for_all_mhs(...)  [MANDATORY — part of every Agent 4 run unless user explicitly says skip]
+  Inputs:  per_mh_results from 7a, same location_df, Load Profile (via a3.build_load_profile_interp)
+  Outputs: Dock_Schedule.csv, Route_Speed.csv, DH_Speed.csv, Speed_Summary.csv, Dock_Utilization.html
 ```
 
 ---
@@ -199,22 +234,23 @@ Also present:
 
 **Claude accepts per-pair decisions.** Partial acceptance (accept some pairs, reject others) is valid.
 
-**MANDATORY — the instant accept/reject resolves into a final `{DH_key: new_MH}` dict, before doing anything else:** call `a3.build_updated_plan_volume(plan_vol_df, accepted_changes, pathway_df)` and overwrite `plan_volume.csv` with the result (`r["data"]`). This runs every time Checkpoint 2 produces any accepted changes — never only when Agent 3 will be re-run again, never skipped because "this run only needs Agent 4." `dh_fc_mh_assignment.csv` already gets patched at this same moment (existing manual-merge pattern); `plan_volume.csv` must be kept in sync with it, or the two files silently disagree about network topology for every moved DH. Review `result["issues"]` before trusting the output — see AGENT3.md §8b for the full rule, the exact sequence, and the FBF-specific rebuild logic.
+**MANDATORY — the instant accept/reject resolves into a final `{DH_key: new_MH}` dict, before doing anything else:** call `build_updated_plan_volume`, save the result as `plan_volume_updated.csv` in the **Phase 2 subfolder** (not in Agent 1's output folder — Agent 1 outputs are immutable). Patch `dh_fc_mh_assignment.csv` in the Agent 3 run folder at the same moment. Review `result["issues"]` before trusting the updated plan volume. See AGENT3.md §8b.
 
 ---
 
-### Checkpoint 3 — After build_location_file and preflight_check
+### Checkpoint 3 — After build_freeze_day_location_file and preflight_check
 
 **What Claude presents:**
 - List of DHs missing ML values in DH Feasibility.csv (status=partial trigger)
-- List of DHs missing lat/long
+- List of DHs missing lat/long (critical — ILP will fail for the whole MH cluster)
 - List of DHs missing MHDH rate card entry
 - Any preflight_check failures
+- Confirmation that `dh_daywise_volume.csv` exists for the same Agent 1 run
 
 **What Claude asks:**
 > "These DHs will be excluded from Agent 4 or cause partial results. Do you want to fix the source files and re-run preflight, or proceed with the current set?"
 
-**Claude does not call run_agent4_for_mh until the user responds.**
+**Claude does not call `run_agent4_freeze_day_pipeline` until the user responds.**
 
 ---
 

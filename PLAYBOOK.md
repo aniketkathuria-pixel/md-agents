@@ -21,6 +21,179 @@ Date: [YYYY-MM-DD]
 
 ---
 
+## Orchestrator flows
+
+Task-order and decision pointers for Claude as orchestrator. Function names and call signatures live in the relevant AGENT MDs — not here.
+
+### Choosing which Agent 1 output folder to reuse
+**When:** User says "use old Agent 1 output" or "don't re-run Agent 1".
+**Rule:** Load `plan_volume.csv`, `fbf_plan_dh_aggregate.csv`, and `fbf_network_pathway_wide.csv` from the **same** Agent 1 output folder — never mix files across folders.
+**Which folder:**
+- `run_20260715` — canonical June Agent 1 (SD window day_32–61); default when user says "old" without specifying. **Agent 4 requires `dh_daywise_volume.csv`** — if this folder lacks it, re-run Agent 1 with `include_daywise=True` or use a folder that has it.
+- `run_20260721` — refresh re-run of the same June window; use only if user explicitly wants that refresh.
+- Any Agent 1 folder with `dh_daywise_volume.csv` — required for Agent 4. Agent 1 must be called with `include_daywise=True` if daywise is missing.
+**Agents involved:** Agent 1 (output only), Agent 3+
+**Date:** 2026-07-27
+
+### Agent 3 — post-run report before Checkpoint 1
+**When:** Immediately after `run_agent3` returns.
+**Present to user:**
+- `status`, total DHs, speed vs cost assignment counts, error count, DHs moved (`current_fc_mh ≠ assigned_fc_mh`).
+- Output folder path.
+- **Table 1:** `build_phase2_candidates` only — valid Phase 2 inputs. Savings columns are **daily**; multiply by 30 before labeling as monthly (see AGENT3.md Checkpoint 1).
+- **Table 2:** `build_cost_only_opportunities` — informational only; never offer as Phase 2 inputs.
+- If `status=partial`: surface `smh_missing_rate_card_edges.csv` — affected lanes may have understated MH→MH cost. Proceed only if user accepts that risk.
+**Agents involved:** Agent 3
+**Date:** 2026-07-27
+
+### Phase 2 — before running
+**When:** User approves one or more pairs from Checkpoint 1 Table 1.
+**Checks:**
+- Tuple direction is `(from_mh, to_mh)` = `(current_fc_mh, assigned_fc_mh)` from Agent 3 — reversed tuple finds zero flagged DHs.
+- Location file must reflect **current** Agent 3 assignment merged with DH Feasibility. Do **not** reuse `Inputs\Location_File_final.xlsx` (or any prior-run location file) unless confirmed identical to the current `dh_fc_mh_assignment.csv`.
+- Write Phase 2 outputs to **`Agent_3_phase2_{DDMMYY}_{HHMM}`** inside the parent Agent 3 Phase 1 run folder (not a sibling folder at the same level).
+**Agents involved:** Agent 3 Phase 2
+**Date:** 2026-07-27
+
+### Checkpoint 2 — accept close-out (mandatory, in order)
+**When:** User accepts one or more Phase 2 pair results.
+**Sequence** (see AGENT3.md §8b for function detail):
+1. Read `Per_DH_Detail` from each accepted pair workbook.
+2. Build `accepted_changes` from rows where **`Moved = True` only** — pool DHs that Phase 2 evaluated but kept at the original MH must **not** be included.
+3. Patch `dh_fc_mh_assignment.csv` in the Agent 3 Phase 1 run folder: set both `current_fc_mh` and `assigned_fc_mh` to the new MH for each accepted DH. Save `dh_fc_mh_assignment_final.csv`.
+4. Call `build_updated_plan_volume` using the **original** Agent 1 `plan_volume.csv` (read-only input). Save result as **`plan_volume_updated.csv` in the Phase 2 subfolder only** — never overwrite Agent 1's `plan_volume.csv`.
+5. Review `build_updated_plan_volume` issues and `Path_Status` counts before treating the updated file as trusted.
+6. Retain the `accepted_changes` dict for Agent 4 (see next entry).
+**Agents involved:** Agent 3 Phase 2, Agent 1 output (read-only input)
+**Date:** 2026-07-27
+
+### Agent 4 after Phase 2 — passing accepted MH moves
+**When:** Building the location file for Agent 4 after Phase 2 acceptance.
+**Two valid approaches** (pick one; they must not contradict each other):
+- **Override dict:** Pass `phase2_accepted_changes` to `build_freeze_day_location_file` — all DHs keep resort `current_fc_mh` except those in the dict.
+- **Patched assignment CSV:** `current_fc_mh` already updated in `dh_fc_mh_assignment_final.csv` — pass empty dict or omit overrides.
+**Rule:** If both are used, the dict and the CSV must agree on every moved DH. A bad key in the dict is a silent skip (`phase2_dh_not_found`), not an error — verify overrides applied.
+**Agents involved:** Agent 4
+**Date:** 2026-07-27
+
+### Agent 4 — how to run (freeze-day + dock scheduling)
+**When:** User says "run Agent 4" (any scope — full network or specific MHs).
+**Rule:** Always run **both** steps unless user explicitly says to skip dock scheduling.
+
+**Python modules:**
+| Module | Role |
+|---|---|
+| `agent4_freeze_day.py` | Main pipeline — freeze-day search, spillover, baseline comparison |
+| `agent4_dock_scheduling.py` | Mandatory post-step — dock ILP, Actual D1%/speed%, `Dock_Utilization.html` |
+| `agent4.py` | **Phase 2 only** — orchestrator does not call this for Agent 4 runs |
+
+**Required inputs** (all from `Inputs\` unless noted):
+- Agent 3 assignment (`dh_fc_mh_assignment_final.csv` or equivalent)
+- Agent 1 `dh_daywise_volume.csv` (same run folder as plan_volume — **must exist**)
+- H2H network file (`Consolidated H2H … H2H.csv`)
+- `DH Feasibility.csv`, `Distance Matrix.csv`, `Lat Longs.xlsx`, `MHDH_RateCard.xlsx`, `Load Profile.csv`
+
+**Call sequence:**
+```python
+import sys, io
+from pathlib import Path
+import pandas as pd
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+
+import agent3 as a3
+import agent4 as a4
+import agent4_freeze_day as fd
+import agent4_dock_scheduling as ds
+
+ROOT = Path(r'...')   # project root
+INP  = ROOT / 'Inputs'
+BACK = ROOT / 'Agent4_Routing' / 'backend'
+cfg  = a4.load_agent4_config(BACK / 'agent4_config.json')
+
+# Load inputs
+assign_df   = pd.read_csv(agent3_out / 'dh_fc_mh_assignment_final.csv', low_memory=False)
+daywise_df  = pd.read_csv(agent1_out / 'dh_daywise_volume.csv')
+h2h_df      = pd.read_csv(INP / "Consolidated H2H June'26 Network - June'26 H2H.csv", low_memory=False)
+feas_df     = pd.read_csv(INP / 'DH Feasibility.csv', low_memory=False)
+dist_df     = pd.read_csv(INP / 'Distance Matrix.csv', dtype=str)
+dist_df['distance'] = pd.to_numeric(dist_df['distance'], errors='coerce')
+lat_df      = pd.read_excel(INP / 'Lat Longs.xlsx', engine='openpyxl')
+load_df     = pd.read_csv(INP / 'Load Profile.csv')
+mh_configs  = a4.load_rate_card(INP / 'MHDH_RateCard.xlsx', cfg)
+mhdh_df     = pd.read_excel(INP / 'MHDH_RateCard.xlsx', engine='openpyxl')
+
+# Optional: scope to specific MHs
+# assign_df = assign_df[assign_df['current_fc_mh'].isin(['CENTRALHUB_FPT'])].copy()
+# mh_configs = {k: v for k, v in mh_configs.items() if k in {'CENTRALHUB_FPT'}}
+
+# Step 1 — location file
+loc_res = fd.build_freeze_day_location_file(
+    assign_df, feas_df, h2h_df, daywise_df, mh_configs, cfg,
+    phase2_accepted_changes=accepted_changes_or_none,
+)
+loc_df = loc_res['data'].dropna(subset=['ML']).copy()
+
+# Step 2 — preflight (Checkpoint 3 if failed)
+pf = a4.preflight_check(loc_df, dist_df, mhdh_df, cfg)
+
+dist_dict = a4.build_distance_dict(dist_df)['data']
+latlong   = a4.build_latlong_dict(lat_df)['data']
+load_interp = a3.build_load_profile_interp(load_df)['data']
+
+out_dir = ROOT / 'Agent4_Routing' / 'output' / f'Agent_4_{DDMMYY}_{HHMM}'
+
+# Step 3 — freeze-day pipeline (always)
+pipeline_res = fd.run_agent4_freeze_day_pipeline(
+    loc_df, dist_dict, latlong, mh_configs, out_dir, cfg,
+    on_progress=lambda msg: print(msg, flush=True),
+)
+fd.write_route_visualizer(pipeline_res['data']['per_mh_results'], latlong, out_dir, cfg)
+
+# Step 4 — dock scheduling (always, unless user said skip)
+dock_res = ds.run_dock_scheduling_for_all_mhs(
+    pipeline_res['data']['per_mh_results'],
+    loc_df, dist_dict, latlong, mh_configs, load_interp, cfg, out_dir,
+    h2h_df=h2h_df,   # required for baseline speed% + DH_Speed baseline columns
+)
+```
+
+**Dock scheduling outputs (when `h2h_df` passed):**
+- `Speed_Summary.csv` — adds `baseline_mh_speed_pct`, `speed_delta_pct` (current H2H TMS vs dock-optimized proposal)
+- `Network_Summary.csv` — adds `baseline_speed_pct`, `optimal_speed_pct`, `speed_improvement_pct`
+- `DH_Speed.csv` — adds `Baseline_TMS`, `Baseline_Arrival_Time`, `Baseline_Capture_Fraction`, `Baseline_D1_Achieved`, `Speed_Delta_Contribution` per DH; **`Arrival_Time` is absolute minutes from order-day (Day 0) midnight** (same scale as `D1_True_Threshold` = 1800 = 6 AM Day 1), not the recurring TMS clock
+- `Expanded_Schedule.csv` — appends `Arrival_Time` / `Departure_Time` per stop (`H:MM AM/PM`), anchored on `Route_Speed.TMS` (recurring clock for display)
+
+**Two time bases (dock scheduling):** TMS / placement / HTML viz use the recurring 0–1440 clock; D1 pass/fail, speed objective, `DH_Speed.Arrival_Time`, and dock ILP occupancy use absolute minutes from order-day midnight. See **"D1 speed scoring — absolute order-day timeline"** below.
+
+**UTF-8 on Windows** — required for ₹ / → in progress logs (see `sys.stdout` wrapper above).
+
+**Run in background** for full network — freeze-day search is long per MH. Scoped single-MH runs can run foreground.
+
+**Output folder:** `Agent4_Routing\output\Agent_4_{DDMMYY}_{HHMM}` — record in `RUN_HISTORY.md`.
+
+**Post-run checks (mandatory):**
+- Every DH in scope present in `Lat Longs.xlsx` (missing → ILP cluster failure → incomplete cost)
+- Check `ilp_status` / `missing_dhs` per MH in freeze-day results — never report a cost if ILP failed
+- Report OSRM pairs from runtime logs
+
+**Ad-hoc single-day** (e.g. "run PAT6 for day 16"): `fd.run_freeze_day_single_day(...)` — still follow with dock scheduling unless user says skip.
+
+**Agents involved:** Agent 1 (daywise), Agent 4
+**Date:** 2026-07-28
+
+### Output folder naming convention
+**When:** Starting any agent run.
+**Pattern** (see PROJECT_CONTEXT.md §2a):
+- `Agent_{N}_{DDMMYY}_{HHMM}` where `N` = agent number (1, 3, or 4), date = day-month-year, time = 24h `HHMM`
+- Agent 3 Phase 2: nested child `Agent_3_phase2_{DDMMYY}_{HHMM}` inside the parent `Agent_3_{DDMMYY}_{HHMM}` folder
+- Agent 4: `Agent4_Routing\output\Agent_4_{DDMMYY}_{HHMM}`
+- Agent 1: `Agent1_DataPrep\output\Agent_1_{DDMMYY}_{HHMM}`
+**Rule:** Record the folder path in `RUN_HISTORY.md`. Legacy `run_YYYYMMDD` folders pre-date this convention.
+**Agents involved:** All
+**Date:** 2026-07-27
+
+---
+
 ## Known patterns
 
 ### SD plan returns empty_result
@@ -30,12 +203,12 @@ Date: [YYYY-MM-DD]
 **Agents involved:** Agent 1
 **Date:** 2026-07-15
 
-### Phase 2 merge — no merge function exists
-**Problem:** After Phase 2 produces Excel workbooks with revised DH assignments, there is no `merge_phase2_changes()` function in agent3.py to automatically apply accepted changes back to `dh_fc_mh_assignment.csv`
-**Root cause:** Phase 2 merge function not yet built
-**Solution:** Manual merge — Claude reads the accepted Phase 2 Excel workbooks, extracts the revised `assigned_fc_mh` values for affected DHs, and updates `dh_fc_mh_assignment.csv` row by row before passing to Agent 4. Verify by checking that affected DH rows now show the new FC_MH value.
+### Phase 2 merge — orchestrator manual steps (supersedes "no merge function")
+**Problem:** After Phase 2, accepted DH moves must be applied to both the assignment file and `plan_volume.csv` before Agent 4.
+**Root cause:** No single `merge_phase2_changes()` function — orchestrator performs the merge.
+**Solution:** Follow **Orchestrator flows → Checkpoint 2 — accept close-out** above. Key gotcha: only `Moved=True` rows from `Per_DH_Detail` go into `accepted_changes`; pool DHs kept at the original MH must be excluded.
 **Agents involved:** Agent 3 Phase 2
-**Date:** 2026-07-15
+**Date:** 2026-07-15 (original), 2026-07-27 (flow documented)
 
 ### `run_phase2` could not actually execute — two backend modules were missing entirely
 **Problem:** Calling `a3.run_phase2(...)` failed immediately with `ModuleNotFoundError: No module named 'agent3_phase2'`. Checked `git log --all` across the whole repo history — `agent3_phase2.py` and `agent4_pipeline.py` had **never existed in this repo, in any commit**. This matched AGENT3.md's own §9 note ("Phase 2 not tested end-to-end with new agent3.py") — it had never actually been runnable.
@@ -59,13 +232,13 @@ Date: [YYYY-MM-DD]
 **Rule:** `status="ok"` at the pipeline level does not mean every MH's cost is complete — it only means the run finished without a hard error. If `Agent4MHResult.ilp_status` shows `"FAILED"` for any cluster, or `missing_dhs` is non-empty, that MH's reported cost is silently missing an entire cluster's worth of milkrun cost. This must be the headline of that MH's result ("Computation FAILED for [MH] — cluster [id] uncovered, DHs: [list], cost is INCOMPLETE"), never a footnote after presenting a number.
 **Root-cause checklist to give alongside the failure** (in order of likelihood): (1) DH missing from `Lat Longs.xlsx` → bearing defaults to 0° → no valid permutations (see the specific pattern below); (2) missing distance data for a required leg, OSRM also failed; (3) genuinely infeasible time window — the DH is too far from its MH for any route composition to arrive before `time_window_end` (check `depot_departure + get_transit_time(dist)` against `time_window_end` directly).
 **Freeze-day engine note:** `run_freeze_day_candidate` (`agent4_freeze_day.py`) calls the same `run_agent4_for_mh` per candidate day, so `ilp_status`/`missing_dhs` are available per candidate, not just the optimal one. Since time-window/distance/position constraints don't vary by simulated day, a structural failure will typically repeat identically across every real and synthetic candidate for that MH — check more than just the winning day.
-**Agents involved:** Agent 4 (both legacy and freeze-day engine)
+**Agents involved:** Agent 4 (freeze-day engine)
 **Date:** 2026-07-23
 
 ---
 
 ### ILP cluster failure — DH missing from Lat Longs.xlsx → incomplete output
-**Problem:** `run_agent4_pipeline` logs `WARN: ILP FAILED for cluster X; uncovered: ['DH_NAME']` and `Step 4 ILP done: 0 routes assigned` for an MH. The result is **incomplete output** — not just for the named DH, but for every milkrun DH in that MH. None of them get a route. This is not a partial result; it is a silent gap in the plan. The pipeline returns `status="ok"` and reports a cost figure, but that cost is FTL-only and dramatically understated.
+**Problem:** Freeze-day or Phase 2 routing logs `WARN: ILP FAILED for cluster X; uncovered: ['DH_NAME']` and `Step 4 ILP done: 0 routes assigned` for an MH. The result is **incomplete output** — not just for the named DH, but for every milkrun DH in that MH.
 
 **Concrete example (run_20260721):** `CENTRALHUB_L_PAT6` had 65 DHs. `SATELLITEHUB_BIHTA` was missing from `Lat Longs.xlsx`. Result: ILP failed → 0 milkrun routes → only 2 FTL routes assigned → reported cost ₹2.32L/month. After adding BIHTA to Lat Longs and re-running: 31 milkrun routes + 2 FTL → correct cost ₹1,07,81,103/month. The difference was ₹1.05 Cr/month — entirely invisible in the first run's output.
 
@@ -82,19 +255,11 @@ print(missing_latlon)   # must be empty before trusting output
 ```
 Also check validation report for `WARN: ILP FAILED` — if present, output is incomplete regardless of `status="ok"`.
 
-**Solution:** Add the missing DH(s) to `Lat Longs.xlsx` (columns: `Site_name`, `Latitude`, `Longitude`), then re-run Agent 4 for the affected MH only — no need to rerun the full pipeline:
+**Solution:** Add the missing DH(s) to `Lat Longs.xlsx`, then re-run Agent 4 for the affected MH(s) only — freeze-day + dock scheduling, scoped to those MHs:
 ```python
-lat_long_df   = pd.read_excel(inp / 'Lat Longs.xlsx')   # reload after fix
 single_mh_loc = loc_df[loc_df['current_fc_mh'] == affected_mh].copy()
-r = a4.run_agent4_pipeline(
-    location_file_df    = single_mh_loc,
-    lat_long_df         = lat_long_df,
-    dist_df             = dist_df,
-    mhdh_rate_card_path = inp / 'MHDH_RateCard.xlsx',
-    out_dir             = out_dir,
-    cfg                 = cfg,
-    on_progress         = lambda msg: print(msg, flush=True),
-)
+single_mh_configs = {affected_mh: mh_configs[affected_mh]}
+# ... run build_freeze_day_location_file scoped, then pipeline + dock scheduling
 ```
 **Note:** A DH can be present in the distance matrix and still missing from Lat Longs — the two gaps are independent. Fixing the distance matrix does not fix this.
 **Agents involved:** Agent 4
@@ -260,143 +425,36 @@ A DH where `current=MPL1, assigned=CJB3` is NOT a valid CJB3→MPL1 Phase 2 cand
 
 ---
 
-### Building the Location File (Agent 4 pre-run)
+### Agent 4 — location file, preflight, and blockers
 
-**MH source logic in `build_location_file`:**
-- All DHs use `current_fc_mh` (resort baseline) as their MH — this is the Phase 1 baseline
-- `assigned_fc_mh` (Agent 3 Phase 1 proposal) is dropped — NOT used
-- Only DHs explicitly listed in `phase2_accepted_changes` get a different MH
+See orchestrator flow **"Agent 4 — how to run"** at the top of this file. Use `build_freeze_day_location_file`, not `build_location_file` alone.
 
-**`phase2_accepted_changes` format:** `{DH_key: new_MH_name}` — read from the `Per_DH_Detail` sheet of accepted Phase 2 workbooks:
-```python
-accepted_changes = {}
-for fname in accepted_phase2_files:
-    detail = pd.read_excel(phase2_out / fname, sheet_name='Per_DH_Detail')
-    for _, row in detail.iterrows():
-        accepted_changes[str(row['DH']).strip()] = str(row['Assigned_MH']).strip()
+**MH source logic:** all DHs use `current_fc_mh` (resort); only `phase2_accepted_changes` overrides apply. Drop null-ML rows before preflight.
 
-loc_result = a4.build_location_file(
-    agent3_assignment_df    = assign_df,
-    dh_feasibility_df       = feasibility_df,
-    phase2_accepted_changes = accepted_changes,
-)
-loc_df = loc_result['data']
-```
-
-**WARNING — bad key in `phase2_accepted_changes` is a silent drop, not an error.** If a DH key does not exist in `assign_df`, the function skips it, appends a `phase2_dh_not_found` issue, and continues. Critically, `status` is driven by null-ML DHs only — so `status="ok"` does NOT guarantee all Phase 2 overrides applied. Always check explicitly:
-```python
-# after build_location_file call
-phase2_issues = [i for i in loc_result['issues'] if i['type'] == 'phase2_dh_not_found']
-if phase2_issues:
-    print("WARNING — phase2 DH keys not found:", phase2_issues)
-```
-This was not observed in the June'26 run (all 8 DH keys were valid), but is a risk whenever accepted_changes dict is built from external workbooks with manual edits.
-
-**After building:** Drop null-ML rows before passing to pipeline:
-```python
-loc_df = loc_df.dropna(subset=['ML']).copy()
-```
+**Known blockers:** missing rate card MHs (skip or fix), missing distance (OSRM if lat/long exists), missing lat/long (**must fix**), missing `dh_daywise_volume.csv` (re-run Agent 1 with `include_daywise=True`), missing ML in DH Feasibility.
 
 ---
 
-### Agent 4 Pre-run Blockers — Known for June'26
+## Agent 4 Freeze-Day + Dock Scheduling — build & run reference
 
-Before running, verify each of these. All four were present at the start of this run:
-
-| Blocker | Status after this run | Resolution |
-|---|---|---|
-| 4 MHs missing from MHDH rate card (AJLX, IXA3X, JLRSF1, KLM1) | JLRSF1 + KLM1 added by user; AJLX + IXA3X still missing | Add missing MHs to `MHDH_RateCard.xlsx`. For AJLX/IXA3X, skip their DHs for now (see below). |
-| 2 MHs missing from distance matrix | Resolved by OSRM fallback at runtime | No action needed — OSRM handles missing distances automatically. |
-| 12 SATELLITEHUB DHs missing ML in DH Feasibility.csv | Fixed by user | Fill ML values in `DH Feasibility.csv` and re-run `build_location_file`. |
-| 4 stale lat/lon rows (REVX, AMD_FLEX, CJB_flex, LKO_FLex) | Still present | These are not in the location file and don't affect routing — clean up Lat Longs.xlsx when convenient. |
-
-**Skipping DHs for MHs with no rate card entry:**
-```python
-skip_mhs = {'CENTRALHUB_LM_AJLX', 'CENTRALHUB_LM_IXA3X'}
-loc_df = loc_df[~loc_df['current_fc_mh'].astype(str).str.strip().isin(skip_mhs)].copy()
-```
-DHs excluded this run: ABA, BLO, LGI, LWT (4 DHs under AJLX/IXA3X).
-
----
-
-### Agent 4 — Full Pipeline Run
-
-**UTF-8 required on Windows** — Agent 4 prints `→` and `₹` characters. Add at top of any run script:
-```python
-import sys, io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
-```
-Without this: `UnicodeEncodeError` on Windows when the pipeline logs milkrun progress.
-
-**Run in background with a long timeout** — full pipeline takes ~30–60 min for 800+ DHs. Use `Bash run_in_background=True` with a 1-hour timeout. Progress logs stream to the background task panel.
-
-**Full call:**
-```python
-r = a4.run_agent4_pipeline(
-    location_file_df    = loc_df,
-    lat_long_df         = lat_long_df,
-    dist_df             = dist_df,
-    mhdh_rate_card_path = inp / 'MHDH_RateCard.xlsx',
-    out_dir             = out_dir,
-    cfg                 = cfg,
-    on_progress         = lambda msg: print(msg, flush=True),
-)
-```
-
-**Fresh import required** — if agent4 was imported earlier in the same session, purge the module cache first:
-```python
-for key in list(sys.modules.keys()):
-    if 'agent4' in key: del sys.modules[key]
-import agent4 as a4
-```
-
-**`r['data']` key reference** — full result dict from `run_agent4_pipeline`:
-
-| Key | Type | Description |
-|---|---|---|
-| `expanded_schedule_df` | DataFrame | All milkrun routes with stops, distances, costs |
-| `final_assignment_df` | DataFrame | DH → truck → MH final mapping |
-| `clustering_output_df` | DataFrame | Bearing-cluster groupings per MH |
-| `dh_route_summary_df` | DataFrame | Per-DH: route type, truck, cost, `in_milkrun_assignment` flag |
-| `absorbed_residuals_df` | DataFrame | DHs absorbed from FTL residuals into milkrun |
-| `osrm_fallback_df` | DataFrame | Pairs where OSRM failed, haversine used instead |
-| `total_monthly_cost` | float | Grand total Rs/month across all MHs |
-| `grand_total_monthly_cost` | float | Alias for `total_monthly_cost` |
-| `validation_report` | str | Full text validation report |
-| `n_mhs` | int | MHs processed |
-| `n_routes` | int | Total routes assigned (milkrun + FTL) |
-| `n_osrm_calls` | int | OSRM calls made at runtime |
-| `out_dir` | Path | Output folder used |
-| `output_files` | dict[str, Path] | Paths to each written CSV/txt output file |
-
-Output files land in the `out_dir` passed to the function. This run: `Agent4_Routing\output\run_20260716b\`.
-
-**Results — June'26 run:**
-- 36 MHs routed, 440 routes, 9,755 OSRM calls
-- Total monthly cost: ₹10,34,09,227 (₹10.34 Cr/mo)
-- Status: ok
-- ILP failures: CENTRALHUB_L_KOL5 (KALIACHAK missing lat/lon), CENTRALHUB_L_PAT6 (BIHTA missing lat/lon) — see standalone pattern below
-
----
-
-## Agent 4 Freeze-Day Engine (`agent4_freeze_day.py`) — build & run reference
-
-**Date introduced:** 2026-07-22/23
-**Agents involved:** Agent 1 (extended), Agent 4 (new additive module)
+**Date introduced:** 2026-07-22/23 (updated 2026-07-28)
+**Agents involved:** Agent 1 (daywise output), Agent 4
 
 ### What it is
 
-A new engine sitting *alongside* the legacy `agent4.py` (`run_agent4_pipeline`, `run_agent4_for_mh` etc.) — it does not replace or modify anything Phase 2 depends on. Instead of costing routes against one aggregate demand snapshot, it tests **every day in the SD-plan window + 7 synthetic extreme days** (peak, median, 5 linear interpolation steps) as a candidate frozen route plan, simulates the real days' demand against each candidate (ad-hoc/spillover cost for whatever doesn't fit), and picks whichever minimizes `committed + adhoc` cost subject to `adhoc% <= cfg['adhoc_pct_limit']`. Also builds a costed baseline of the *current* H2H route network for comparison, and includes a truck-upgrade loop (bump vehicle size on routes that spill too often, keep if it lowers total cost).
+The main Agent 4 pipeline. Tests every day in the SD-plan window + 7 synthetic extreme days, simulates spillover/adhoc, picks the optimum, compares against the H2H baseline, then runs dock scheduling + Actual D1%/speed% on the optimal plan.
 
-**Key design decision:** the per-day candidate costing reuses `agent4.run_agent4_for_mh` verbatim (bearing clustering, FTL stripping, soft position constraints, local/zonal costing, ILP set-cover — all already correct there) rather than reimplementing route generation. Only the day-simulation/spillover/baseline layer on top is genuinely new code.
+**Orchestrator:** see **"Agent 4 — how to run"** at the top of this file. Always run freeze-day + dock scheduling together unless user explicitly says skip dock scheduling.
+
+`agent4.py` is used by Phase 2 only — orchestrator does not call it for Agent 4 runs.
 
 ### New Agent 1 output (extends `build_sd_plan_aggregate`, doesn't add a new function)
 
 `build_sd_plan_aggregate(..., include_daywise=True)` now also returns `result["daywise_data"]` — a DH-level (not MH1×DH) day-by-day table: `destination_hub_key`, `D<n>` (shipment counts), `D<n>_cft` (CFT volume), computed from the **same chunked pass** used for the existing lane aggregate (no second read of the 40GB NFBF file). Default `include_daywise=False` preserves the exact prior behavior/performance. Save via `save_dataframe(result["daywise_data"], out_dir / "dh_daywise_volume.csv")`.
 
-### New agent4.py extension (still backward-compatible)
+### agent4.py — Phase 2 interface only
 
-`build_location_file(..., h2h_df=None, daywise_df=None, cfg=None)` — 3 new optional params, all default `None`/no-op. When `h2h_df` given, merges `Current_MR`/`Current_Freq` from the H2H file (columns: `Dest`, `MR Number`, `frequency Final` — case-insensitive DH-name join, since the raw H2H file has inconsistent casing). When `daywise_df` given, merges the day-wise columns above. Existing callers (Phase 2) passing neither param get byte-identical output.
+`agent4.py` exposes `run_agent4_for_mh` and related types for `agent3_phase2._run_a4_subset`. Phase 2 is the only orchestrator use of this module. `build_location_file` with optional `h2h_df`/`daywise_df` params is called internally by `build_freeze_day_location_file`.
 
 ### Call sequence for a real run
 
@@ -433,6 +491,14 @@ pipeline_res = fd.run_agent4_freeze_day_pipeline(
     on_progress=lambda msg: print(msg, flush=True),   # granular per-MH/per-candidate-day/per-upgrade-iteration logs
 )
 fd.write_route_visualizer(pipeline_res["data"]["per_mh_results"], latlong, out_dir, cfg4)
+
+import agent4_dock_scheduling as ds
+load_interp = a3.build_load_profile_interp(load_df)["data"]
+dock_res = ds.run_dock_scheduling_for_all_mhs(
+    pipeline_res["data"]["per_mh_results"],
+    loc_res["data"], dist_dict, latlong, mh_configs, load_interp, cfg4, out_dir,
+    h2h_df=h2h_df,
+)
 ```
 
 **Restricting to specific MHs**: filter `agent3_df`/`mh_configs` to the target MHs *before* calling `build_freeze_day_location_file`/`run_agent4_freeze_day_pipeline` — e.g. `agent3_df[agent3_df["current_fc_mh"].isin(["CENTRALHUB_L_PAT6", "CENTRALHUB_FPT"])]`.
@@ -471,7 +537,7 @@ First real-data validation, on top of the June'26 Agent 1/Agent 3 outputs (`run_
 
 **Problem:** After building `agent4_dock_scheduling.py` (dock ILP, CX-cutoff capture-fraction, Actual D1%/speed metric — see AGENT4.md §7b) against synthetic conflict scenarios only, needed to confirm it runs cleanly end-to-end on real production data and produces sane numbers.
 
-**Setup:** Reran the full freeze-day pipeline (not just dock scheduling) for CENTRALHUB_L_PAT6 (65 DHs, 30 docks) and CENTRALHUB_FPT (30 DHs, 15 docks) from `MHDH_RateCard.xlsx`'s `Docks` column, using the same `run_freeze_day_test_20260722` Agent 1/Agent 3 base data plus `Inputs\Load Profile.csv` (reused via `a3.build_load_profile_interp`, not re-implemented). A rerun of the full freeze-day search was required (not just the dock step) because the rollover mechanism changes `time_window_end` feasibility, which can change which candidate day is optimal.
+**Setup:** Full freeze-day + dock scheduling for CENTRALHUB_L_PAT6 (65 DHs, 30 docks) and CENTRALHUB_FPT (30 DHs, 15 docks). Dock scheduling is part of every Agent 4 run — not a separate optional step.
 
 **Result — freeze-day optimum (with rollover mechanism live for the first time on real data):**
 
@@ -486,8 +552,10 @@ Both figures differ from the pre-rollover PAT6/FPT test run above (PAT6 was D47/
 
 | MH | Docks total | Docks committed (95% after adhoc reserve) | Routes | Weighted Actual D1% (speed) |
 |---|---|---|---|---|
-| CENTRALHUB_L_PAT6 | 30 | 28 | 36 | 72.8% |
-| CENTRALHUB_FPT | 15 | 14 | 19 | 75.5% |
+| CENTRALHUB_L_PAT6 | 30 | 28 | 36 | 72.8%* |
+| CENTRALHUB_FPT | 15 | 14 | 19 | 75.5%* |
+
+\*Speed% superseded — pre D1 absolute-timeline fix (2026-07-28). Authoritative FPT proposal speed after fix: **75.0%** (`Agent_4_280726_1709_FPT`). PAT6 not yet re-run post-fix.
 
 Of 55 total routes across both MHs, only **1** needed a dock-forced TMS shift away from its dock-unconstrained ideal departure (PAT6 Route 30: preponed 180 min, dropping that route's own speed contribution to 35.3%) — confirms dock contention is genuinely rare at these MHs' current dock counts (28–30 committed docks against 36 routes), and the ILP only intervenes when it actually has to.
 
@@ -512,6 +580,21 @@ Of 55 total routes across both MHs, only **1** needed a dock-forced TMS shift aw
 
 **Can also be regenerated standalone** (e.g. against previously-written CSVs without rerunning the ILP) via `write_dock_utilization_visualizer(schedule_df, route_speed_df, mh_configs, cfg, out_dir)` — if reloading `Dock_Schedule.csv` from disk, parse the `hubs` column back from its string repr with `ast.literal_eval` first (`to_csv` stringifies list columns; `build_dock_utilization_data` handles this automatically when it detects a string).
 
+### Baseline speed from H2H TMS (`agent4_dock_scheduling.py`)
+**When:** Every dock-scheduling run where `h2h_df` is passed to `run_dock_scheduling_for_all_mhs`.
+**What:** Computes **current-network speed%** using actual H2H `TMS` values (no dock ILP — operational departures are taken as fixed). Same weighted Top266 formula as proposal speed (CX cutoff → load profile → D1 true threshold).
+**TMS selection rules:**
+- Duplicate H2H rows for same `(Src, Dest)` → **latest TMS** (max minutes — later departure captures more volume)
+- Milkrun MR groups → **latest TMS across hubs** in that `(MH, MR Number)`; log `baseline_tms_inconsistent` if spread **> 30 min** (still uses latest)
+- Synthetic baseline truck splits (capacity-driven) → same MR-level TMS on all split trucks
+- Missing TMS → fallback to computed ideal departure + `baseline_tms_missing` issue
+**Outputs:** `baseline_mh_speed_pct` / `speed_delta_pct` in `Speed_Summary.csv`; speed columns in `Network_Summary.csv`; per-DH baseline columns + `Speed_Delta_Contribution` in `DH_Speed.csv`.
+**Verified:** FPT re-run `Agent_4_280726_1709_FPT` (post D1 absolute-timeline fix) — baseline **63.4%** → proposal **75.0%** (+11.6 pp); cost savings unchanged (D60, ₹37.8L/mo). Prior run `Agent_4_280726_1644_FPT` showed **90.2%** proposal — **invalid** (D1 checked on recurring clock, not absolute).
+
+### Expanded schedule stop times (`agent4_dock_scheduling.py`)
+**When:** Automatically during `run_dock_scheduling_for_all_mhs` if `Expanded_Schedule.csv` already exists in `out_dir` (written by freeze-day pipeline).
+**What:** Joins each route to dock-chosen `Route_Speed.TMS`, simulates per-leg arrival/departure (same logic as legacy `agent4.py` Steps 6–9), writes `Arrival_Time` / `Departure_Time` columns back to the same file in `H:MM AM/PM` format.
+
 **Agents involved:** Agent 4 (dock-scheduling module)
 **Date:** 2026-07-23
 
@@ -529,11 +612,43 @@ Of 55 total routes across both MHs, only **1** needed a dock-forced TMS shift aw
 
 **Fix (`agent4_dock_scheduling.py`):**
 1. **FTL/MR sync:** a DH's FTL_Dedicated route(s), if that same DH also has a Milkrun route, get no independent ILP variable at all (`linked_ftl` in `schedule_docks_and_compute_speed`) — they inherit the Milkrun route's chosen TMS, while still consuming their own dock-capacity window (2 real trucks, 2 real docks, same clock time). Their DH's Top266 volume is deliberately NOT double-counted in the objective/`dh_speed_df` — it's already scored once via the Milkrun route.
-2. **Daily-cycle time:** the dock-scheduling "ideal" anchor is now computed against each DH's TRUE, un-relaxed deadline (`d1_true_threshold`, always ~1800 min regardless of rollover) instead of the possibly rollover-inflated `time_window_end`, then folded into a genuine single-day clock value via `% 1440`. Dock-capacity windows are checked circularly (`_circular_windows`) against one fixed one-day grid, so a window straddling midnight is correctly seen as adjacent to whatever sits right after it. `_cx_cutoff_hour` simplified to a plain modulo (the old clamp-at-both-ends logic was itself a symptom of the linear-time framing — with `t` now always in `[0,1440)`, the ">=1440 day-boundary" case this was protecting against can no longer occur).
+2. **Daily-cycle TMS anchor:** the dock-scheduling "ideal" anchor is now computed against each DH's TRUE, un-relaxed deadline (`d1_true_threshold`, always ~1800 min regardless of rollover) instead of the possibly rollover-inflated `time_window_end`, then folded into a genuine single-day clock value via `% 1440`. `_cx_cutoff_hour` simplified to order-day hour lookup with a midnight plateau (see D1 absolute-timeline entry below). **Dock-capacity ILP** originally used `_circular_windows` on the recurring clock; superseded 2026-07-28 by a **linear absolute grid** (order day 0 through D1 SLA) — see next section.
 3. **A bug found in the fix itself, caught by testing:** the pre-existing tie-break ("prefer larger raw TMS," used to mean "prefer less preponing" when time was linear) stopped meaning that once preponing could wrap past midnight — preponing 5.8h from 05:40 wraps to 23:50, a numerically *larger* value despite being a *bigger* step away from the ideal. Fixed by tracking each candidate's actual prepone-step count and tying-breaking on that directly (`step_of`), not on raw clock value. Caught by a synthetic test asserting a zero-Top266 route with no dock contention stays at its own natural ideal — it didn't, until this was fixed.
 
 **Verified with 3 synthetic tests:** (1) FTL+MR for one DH land on the exact same TMS, and the DH appears exactly once in `dh_speed_df`; (2) a route made entirely of a zero-Top266, rollover-relaxed DH stays bounded in `[0,1440)` *and* stays at its true single-day ideal (old code gave ~3,220 min); (3) two routes ~30 real minutes apart across midnight, with only 1 committed dock, are correctly detected as conflicting and resolved (chosen windows verified non-overlapping via `_circular_windows`).
 
-**Known follow-ups, not fixed (flagged, not silently ignored):** the Dock Utilization HTML visualizer draws bars assuming non-wrapping windows — a route whose window now straddles midnight may render oddly; FTL loading-duration is still computed from a DH's *full* `total_shipments` independently for both legs when split (pre-existing simplification, now more visible since the FTL/MR link is formalized).
+**Known follow-ups, not fixed (flagged, not silently ignored):** the Dock Utilization HTML visualizer still draws bars on the recurring 0–1440 clock (circular segment split for midnight wraps) — correct for daily display, but `DH_Speed.Arrival_Time` is on the absolute scale; FTL loading-duration is still computed from a DH's *full* `total_shipments` independently for both legs when split (pre-existing simplification, now more visible since the FTL/MR link is formalized).
 **Agents involved:** Agent 4 (dock-scheduling module)
 **Date:** 2026-07-27
+
+---
+
+### D1 speed scoring — absolute order-day timeline (dock scheduling bug #3)
+
+**Problem:** After the daily-recurring dock refactor (2026-07-27), D1% checks and the speed ILP objective still compared DH **arrivals** on the recurring 0–1440 **clock** against `d1_true_threshold` (**1800** = 6 AM Day 1 absolute). Early-morning departures were falsely credited: a truck leaving at 3:55 AM (clock 235) and arriving at a DH at 6:49 AM (clock 409) compared `409 ≤ 1800` → pass, when the true absolute arrival is `1440 + 409 = 1849` → **fail**.
+
+**Concrete example (FPT Route 15, pre-fix `Agent_4_280726_1644_FPT`):** `FPT → HOSHIARPUR → UNA → KHANNA1 → FPT`, TMS clock **234.5** (absolute **1674.5**). HOSHIARPUR arrival clock **408.5** → absolute **1848.5** > 1800. Old code scored Route_Speed **99.6%**; post-fix **42.5%** with TMS shifted to evening (**1104.5** clock).
+
+**Root cause:** Dock occupancy correctly needed a repeating daily clock, but D1 SLA is anchored on the **order cycle** (Day 0 midnight → 6 AM Day 1), not a route-local clock that resets at midnight.
+
+**Fix (`agent4_dock_scheduling.py`) — two time bases:**
+
+| Concept | Time base |
+|---|---|
+| TMS, Placement_Time, Expanded_Schedule stop times, Dock Utilization HTML | Recurring clock **0–1440** (same departure every operational day) |
+| D1 pass/fail, speed objective, `DH_Speed.Arrival_Time`, dock ILP occupancy grid | **Absolute** minutes from order-day (Day 0) midnight through D1 SLA |
+
+**Rules:**
+- `_clock_to_absolute(t)`: if `t % 1440 < 360` (before 6 AM on the clock) → calendar Day 1 morning → `1440 + t`; else Day 0 → `t`
+- D1 pass: `arrival_abs = clock_to_absolute(TMS) + transit_offset ≤ d1_true_threshold` (per-DH, default **1800**)
+- Load profile (**Day-0 orders only** until Agent 1 supplies Day-1 load): CX cutoff → order-day hour; **plateau at hour 24** once `cutoff_abs ≥ 1440`
+- Dock ILP capacity: linear grid **0 → `dock_d1_horizon_min`** (default 1800 + `dock_transition_buffer_min`), windows via `_dock_window_abs` — not `_circular_windows`
+
+**Helpers:** `_clock_to_absolute`, `_arrival_abs`, `_capture_fraction_from_tms`, `_cx_cutoff_order_day_hour`, `_dock_window_abs`, `_dock_horizon_min`.
+
+**Verified:** FPT `Agent_4_280726_1709_FPT` — baseline **63.4%** → proposal **75.0%** (+11.6 pp); costs unchanged (D60, 8.6% adhoc, ₹37.8L/mo). Route 15 regression: TMS 234.5 → 1104.5, KHANNA1 `Arrival_Time` **1800** abs.
+
+**Re-run needed:** Any speed% from runs before 2026-07-28 (including Jul-23 PAT6+FPT combined run at 72.8%/75.5%) used pre-fix D1 logic — costs remain valid; speed columns are not authoritative until re-run with fixed code.
+
+**Agents involved:** Agent 4 (dock-scheduling module)
+**Date:** 2026-07-28

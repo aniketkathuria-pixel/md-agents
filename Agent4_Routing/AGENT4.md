@@ -4,70 +4,108 @@
 
 Before using anything in this file, verify you can answer these questions from memory:
 - What is ML, why does it vary by DH, and what happens if a DH has no ML value?
-- What is the difference between a milkrun and an FTL dedicated truck, and what determines which a DH gets?
-- Why must preflight_check pass before run_agent4_pipeline is called — what does it actually protect against?
+- What are the three Python modules under `Agent4_Routing\backend\` and which one does the orchestrator call for a full Agent 4 run?
+- Why is dock scheduling mandatory after the freeze-day pipeline?
 
-If you cannot answer all three — stop. Re-read `SUPPLY_CHAIN_CONTEXT.md §4` (MH→DH Milkrun Leg) and `INPUT_CONTEXT.md` entries IN0201, IN0301 before continuing.
+If you cannot answer all three — stop. Re-read §0 (Architecture) and `PLAYBOOK.md` orchestrator flows before continuing.
 
 Also check: have you read `PROJECT_CONTEXT.md §9` (Problem-First Framework) this session? If not, read it now.
 
 ---
 
-## 1. Purpose & Supply Chain Role
+## 0. Architecture — Three Python Modules
 
-Agent 4 solves the last-mile milkrun scheduling problem: given a confirmed DH→FC_MH assignment from Agent 3, it builds cost-optimal truck routes from each MH depot to its assigned DHs. For each MH, the pipeline proceeds in four stages: (1) bearing-based clustering groups DHs by compass direction from the depot so permutations are only generated within geographically coherent groups; (2) permutation generation enumerates all valid stop sequences up to `max_hops` within each cluster, filtering by time-window feasibility and distance data availability; (3) cost scoring and domination pruning assigns vehicle size and monthly cost to each route and eliminates dominated options (same hub-set, higher cost); (4) ILP set-cover selects the minimum-cost subset of routes that covers every DH in the cluster exactly once. DHs whose total demand exceeds the ML vehicle capacity gate are split into dedicated FTL trucks before the milkrun step, with any sub-threshold residual either absorbed into FTL or re-entered into milkrun. The output is a full operational route schedule: which truck visits which DHs, in what order, at what frequency, with arrival and departure times at every stop.
+| Module | Orchestrator uses it for… |
+|---|---|
+| **`agent4_freeze_day.py`** | **Main Agent 4 pipeline.** Freeze-day search, spillover/adhoc simulation, baseline vs optimal, route visualizer. |
+| **`agent4_dock_scheduling.py`** | **Mandatory post-step** after every freeze-day run (unless user explicitly says skip). Dock ILP, CX-cutoff, Actual D1%/speed%, `Dock_Utilization.html`. |
+| **`agent4.py`** | **Phase 2 only.** `run_agent4_for_mh` is called by `agent3_phase2.py` to cost candidate DH assignments during pair evaluation. The orchestrator does **not** call `agent4.py` for Agent 4 runs. |
 
-**Pipeline position:** Agent 4 is the terminal agent. It consumes:
-- Agent 3's `dh_fc_mh_assignment.csv` (DH→FC_MH assignment with demand, CFT, top-266 load)
-- Agent 2's Distance Matrix CSV (pairwise km between all hubs)
-- Agent 2's MHDH_RateCard.xlsx (per-MH truck rates by vehicle size, local vs zonal)
-- DH Feasibility CSV (per-DH ML constraint — max vehicle length allowed at that DH)
-- Lat Longs XLSX (hub coordinates for OSRM fallback and bearing clustering)
-
-Its outputs are the actual truck movements used for operational planning and accruals.
+**When the user says "run Agent 4":**
+```
+build_freeze_day_location_file  →  preflight_check  →  run_agent4_freeze_day_pipeline  →  run_dock_scheduling_for_all_mhs
+```
 
 ---
 
-## 2. Two-Step Pre-run Process (Claude's Job)
+## 1. Purpose & Supply Chain Role
 
-Agent 4 requires a mandatory two-step setup before `run_agent4_pipeline` can be called. This is different from Agents 1–3, which have no mandatory gate.
+Agent 4 solves the last-mile milkrun scheduling problem: given a confirmed DH→FC_MH assignment from Agent 3, it finds the optimal **freeze day** (which day's demand pattern to size routes against), builds cost-optimal truck routes from each MH depot to its assigned DHs, simulates spillover/adhoc cost on all other days, compares against the current H2H baseline, and then schedules routes on physical docks with a genuine post-routing speed metric.
 
-### Step 1 — Build the Location File
+For each candidate freeze day, per-MH routing uses bearing clustering → permutation generation → cost/pruning → ILP set-cover (via `run_agent4_for_mh` inside the freeze-day engine). DHs whose demand exceeds ML vehicle capacity are split into dedicated FTL trucks first.
 
-Call `build_location_file(agent3_assignment_df, dh_feasibility_df)` to merge Agent 3's output with the DH Feasibility file and produce the location file DataFrame. This merges on `destination_hub_key`, renames `assigned_fc_mh` to `current_fc_mh`, applies time-window defaults, and flags any DHs whose ML is missing from the Feasibility file.
+**Pipeline position:** Agent 4 is the terminal agent. It consumes:
+- Agent 3's `dh_fc_mh_assignment.csv` (or `dh_fc_mh_assignment_final.csv` after Phase 2)
+- Agent 1's `dh_daywise_volume.csv` (day-by-day demand — **required**)
+- H2H network file (`Current_MR` / `Current_Freq` baseline)
+- Agent 2's Distance Matrix CSV, MHDH rate card, DH Feasibility, Lat Longs
+- `Load Profile.csv` (for dock scheduling step)
 
-`build_location_file` never returns `status="failed"`. It returns:
-- `status="ok"` — all DHs have an ML value; location file is ready for preflight
-- `status="partial"` — one or more DHs have no ML in DH Feasibility; 12 null-ML rows are included in `data` so the caller can see which DHs are affected
+Its outputs are the frozen route plan, baseline comparison, dock schedule, and speed metrics used for operational planning.
 
-**If `status="partial"`, do not proceed.** Surface the `missing_ml` issues to the user. The user must add ML values for those DHs in `DH Feasibility.csv` before continuing.
+---
+
+## 2. Pre-run Process (Claude's Job)
+
+Agent 4 requires a mandatory setup before `run_agent4_freeze_day_pipeline` can be called.
+
+### Step 1 — Build the Freeze-Day Location File
+
+Call `build_freeze_day_location_file(agent3_df, feas_df, h2h_df, daywise_df, mh_configs, cfg, phase2_accepted_changes=...)`.
+
+This calls `build_location_file` internally for base columns (ML, MH assignment, time windows), then merges day-wise demand columns, H2H baseline routes, synthetic extreme days, and rollover-adjusted feasibility windows.
+
+Returns `status="ok"` or `status="partial"` (null-ML DHs). **If `status="partial"`, do not proceed** — fix DH Feasibility first.
+
+Drop null-ML rows before the pipeline:
+```python
+loc_df = loc_df.dropna(subset=["ML"]).copy()
+```
+
+**MH baseline logic** (same as `build_location_file`): all DHs use `current_fc_mh` (resort); only `phase2_accepted_changes` overrides apply.
 
 ### Step 2 — Run Preflight Check (Hard Gate)
 
-Call `preflight_check(location_file_df, dist_df, mhdh_rate_card_df, cfg)`. This is a binary hard gate: it returns either `status="ok"` (all 5 checks pass) or `status="failed"` (one or more checks failed). Never call `run_agent4_pipeline` unless `preflight_check` returns `status="ok"`.
+Call `preflight_check(loc_df, dist_df, mhdh_rate_card_df, cfg)` on the scoped location file (drop null ML first). Binary gate: `status="ok"` or `status="failed"`.
 
-If `preflight_check` fails, show all issues to the user, wait for source-data fixes, then re-run preflight. Do not bypass or skip this check.
+Present failures at Checkpoint 3. Do not call the freeze-day pipeline until the user responds.
+
+### Step 3 — Freeze-Day Pipeline (mandatory)
+
+```python
+pipeline_res = fd.run_agent4_freeze_day_pipeline(
+    loc_df, dist_dict, latlong, mh_configs, out_dir, cfg,
+    on_progress=lambda msg: print(msg, flush=True),
+)
+fd.write_route_visualizer(pipeline_res["data"]["per_mh_results"], latlong, out_dir, cfg)
+```
+
+### Step 4 — Dock Scheduling (mandatory unless user says skip)
+
+```python
+load_profile_interp = a3.build_load_profile_interp(load_profile_df)["data"]
+dock_res = ds.run_dock_scheduling_for_all_mhs(
+    pipeline_res["data"]["per_mh_results"],
+    loc_df, dist_dict, latlong, mh_configs, load_profile_interp, cfg, out_dir,
+)
+```
 
 ### Decision Tree
 
 ```
-1. build_location_file()
+1. build_freeze_day_location_file()
    └─ status="ok"    → proceed to step 2
-   └─ status="partial"
-       └─ show missing_ml issues to user
-       └─ user updates DH Feasibility.csv with correct ML values
-       └─ re-run build_location_file()
-       └─ repeat until status="ok"
+   └─ status="partial" → fix missing ML in DH Feasibility, rebuild
 
 2. preflight_check()
-   └─ status="ok"    → call run_agent4_pipeline()
-   └─ status="failed"
-       └─ show ALL issues to user (null_ml / invalid_ml / mh_not_in_rate_card /
-          dh_missing_distance / mh_missing_distance)
-       └─ user fixes source data (rate card, distance matrix, feasibility file)
-       └─ re-run preflight_check()
-       └─ repeat until status="ok"
+   └─ status="ok"    → Checkpoint 3 passed → steps 3 + 4
+   └─ status="failed" → present issues, wait for user
+
+3. run_agent4_freeze_day_pipeline()   ← always
+4. run_dock_scheduling_for_all_mhs()  ← always (unless user explicitly says skip)
 ```
+
+**Scoped runs:** filter `agent3_df` and `mh_configs` to target MHs before step 1.
 
 ---
 
@@ -79,12 +117,13 @@ Before calling any public function, verify the preconditions below. These are st
 |---|---|---|
 | `load_agent4_config` | None | Safe to call with no arguments; returns a complete 14-key dict using built-in defaults. Pass `config_path=Path(...)` to override individual keys from file. |
 | `build_location_file` | `agent3_assignment_df` must have `destination_hub_key`, `assigned_fc_mh`, `total_cft`, `top266_shipments`, `total_shipments` columns. `dh_feasibility_df` must have `destination_hub_key`, `ML` columns. | Load Agent 3 output with `pd.read_csv`. Load DH Feasibility with `pd.read_csv`. Do NOT pass filepaths — pass DataFrames. |
-| `preflight_check` | `location_file_df` must be the `data` from `build_location_file` result (or a DataFrame with the same schema). `dist_df` must have `S_Code`, `D_Code`, `distance` columns. `mhdh_rate_card_df` must have `MH1` column. `cfg` must be from `load_agent4_config`. | Load distance matrix with `pd.read_csv(path, dtype=str)`. Load rate card with `pd.read_excel(path)`. Call this function before `run_agent4_pipeline` — never skip. |
-| `build_distance_dict` | `dist_df` must have `S_Code`, `D_Code`, `distance` columns. Distance values should be numeric; non-numeric rows produce `missing_distance` issues but do not fail the call. | Agent 4 does NOT read distance matrix with `dtype=str` internally — but calling code should pass the raw DataFrame. Hub name case must exactly match the location file (`.strip()` only, no case normalisation). |
-| `build_latlong_dict` | `ll_df` must have `Site_name`, `Latitude`, `Longitude` columns. | Load from `Lat Longs.xlsx` with `pd.read_excel`. Non-numeric lat/lon rows emit `invalid_latlong` issues. |
-| `run_agent4_pipeline` | (a) `preflight_check` must have returned `status="ok"` for the same `location_file_df`. (b) All null-ML rows must be dropped from `location_file_df` before calling (pipeline uses ML as a float; null ML causes `float(NaN)` and defaults to 40ft, which has sentinel cost 999 — those DHs will silently get no viable route). (c) `mhdh_rate_card_path` must be a `Path` object pointing to an existing file. (d) `out_dir` will be created if it does not exist. | Drop nulls: `loc_df = loc_df.dropna(subset=["ML"]).copy()`. |
-| `run_agent4_for_mh` | **Claude Code should not call this directly.** Phase 2 calls it directly; the orchestration layer should always call `run_agent4_pipeline`. If calling directly: `dist_dict` must be a mutable dict (the function caches OSRM results in it), `dh_df` must contain only rows for the single MH being processed. | Call `run_agent4_pipeline` instead. |
-| `load_rate_card` | `path` must be a `Path` to an existing `MHDH_RateCard.xlsx`. `cfg` must be from `load_agent4_config`. | Called internally by `run_agent4_pipeline`. Direct calls are for inspection only. |
+| `preflight_check` | `location_file_df` must be from `build_freeze_day_location_file` (or equivalent schema). `dist_df`, `mhdh_rate_card_df`, `cfg` as documented. | Call before `run_agent4_freeze_day_pipeline` — never skip. |
+| `build_freeze_day_location_file` | Agent 3 assignment, DH Feasibility, H2H file, `dh_daywise_volume.csv`, `mh_configs`, `cfg`. Optional `phase2_accepted_changes`. | See §2 Step 1. |
+| `run_agent4_freeze_day_pipeline` | (a) `preflight_check` passed for scoped `loc_df`. (b) Null-ML rows dropped. (c) `mh_configs` from `load_rate_card`. | Main Agent 4 step — see §2 Step 3. |
+| `run_dock_scheduling_for_all_mhs` | `per_mh_results` from freeze-day pipeline; same `loc_df`; `load_profile_interp` from `a3.build_load_profile_interp`. | **Mandatory** after every freeze-day run unless user explicitly says skip — see §2 Step 4. |
+| `build_location_file` | Used internally by `build_freeze_day_location_file`. Orchestrator may call directly only for preflight diagnostics. | Phase 2 does not use this — Phase 2 calls `run_agent4_for_mh` directly. |
+| `run_agent4_for_mh` | **Phase 2 only** (`agent3_phase2._run_a4_subset`). Orchestrator does not call for Agent 4 runs. | Frozen interface — see AGENT3.md §9. |
+| `run_agent4_pipeline` | **Not used by orchestrator.** Exists in `agent4.py` for internal/batch use only. | Do not call when user says "run Agent 4". |
 | `get_distance` | `dist_dict` must be the `data` from a `build_distance_dict` result. OSRM fallback requires internet access. | Pass `use_osrm_fallback: false` in config override to disable OSRM for offline runs (see §6). |
 | `assign_vehicle_length` | `total_demand` must be a float (CFT). | Returns 0.0 for demand ≤ 0. |
 | `derive_freq_allowed` | `top266_load` must be a float (count of Top-266 shipments). | Returns `int`. See §4 for interpretation. |
@@ -135,7 +174,7 @@ Default time-window values applied to every row:
 ```
 Keys can be MH names or DH keys. MH-level overrides are applied first; DH-level overrides are applied second and win. Only the three time-window columns can be overridden; other columns are not modifiable through this dict.
 
-**`status="partial"` means:** at least one DH had no matching row in `dh_feasibility_df`. The 12 null-ML DHs are included in `data` (caller decides whether to drop or fill). The `issues` list contains one `missing_ml` entry per affected DH. Do not pass the DataFrame to `run_agent4_pipeline` until all null-ML rows are dropped.
+**`status="partial"` means:** at least one DH had no matching row in `dh_feasibility_df`. The 12 null-ML DHs are included in `data` (caller decides whether to drop or fill). The `issues` list contains one `missing_ml` entry per affected DH. Do not pass the DataFrame to the freeze-day pipeline until all null-ML rows are dropped.
 
 ---
 
@@ -159,7 +198,7 @@ Hard gate. Never returns `status="partial"`. Returns `status="ok"` only if ALL f
 - Checks 3 fails for 4 MHs not in the rate card: `CENTRALHUB_LM_AJLX`, `CENTRALHUB_LM_IXA3X`, `CENTRALHUB_L_JLRSF1`, `CENTRALHUB_L_KLM1`. These must be added to `MHDH_RateCard.xlsx` before the first production run.
 - Check 5 fails for 2 MHs not in the distance matrix: `CENTRALHUB_L_AURPRC1`, `CENTRALHUB_L_SRTSFL1`. These must be added to `Distance Matrix.csv`.
 
-When `status="failed"`, the pipeline can still run (the function does not block it), but `run_agent4_pipeline` will use default rate cards for missing MHs and those MHs' routes may have incorrect costs. **Never bypass this gate for production runs.**
+When `status="failed"`, do not call `run_agent4_freeze_day_pipeline` until blockers are resolved or the user accepts proceeding at Checkpoint 3.
 
 ---
 
@@ -273,7 +312,7 @@ Internal — called by `run_agent4_for_mh`. Sorts DHs by bearing angle from depo
 ```
 Returns: Agent4MHResult   (dataclass)
 ```
-Runs the complete 4-step routing pipeline (bearing cluster → permutations → cost/pruning → ILP) for a single MH. Phase 2 calls this directly with its own `dist_dict` and `dh_df`; Claude Code should not call this function directly — use `run_agent4_pipeline` instead.
+Runs the complete 4-step routing pipeline for a single MH and a single demand snapshot. **Phase 2 calls this via `_run_a4_subset`.** The freeze-day engine calls it via `run_freeze_day_candidate`. The orchestrator does not call this function directly.
 
 **OSRM logging:** The function creates a local `osrm_log: list` and exposes it via a `contextvars.ContextVar`. Any OSRM calls made during the run (by `get_distance → _osrm_distance_km`) append to this list. After the function returns, the contextvar is reset so subsequent calls have a clean log. The log is stored in `Agent4MHResult.osrm_log`.
 
@@ -299,11 +338,9 @@ Runs the complete 4-step routing pipeline (bearing cluster → permutations → 
 
 ---
 
-### `run_agent4_pipeline(location_file_df, lat_long_df=None, dist_df=None, mhdh_rate_card_path=None, out_dir=None, cfg=None, ...)`
-```
-Returns: {"status": "ok" | "partial" | "failed", "data": {...}, "issues": [...]}
-```
-Runs `run_agent4_for_mh` for every MH in `location_file_df`, writes 8 output files to `out_dir`, and returns an aggregated result dict. Accepts **DataFrames or file paths** for `lat_long` and `distance_matrix` — use whichever the caller already has. DataFrame takes priority if both are provided for the same input.
+### `run_agent4_pipeline(...)` — internal only
+
+**Orchestrator: do not call.** Not part of the Agent 4 run path. Use `run_agent4_freeze_day_pipeline` + `run_dock_scheduling_for_all_mhs` instead. Documented below for reference only.
 
 **Full signature:**
 ```python
@@ -469,44 +506,52 @@ Config file: `backend/agent4_config.json`. All 14 keys are present in the file �
 
 ---
 
+## 6a. Run output folder (orchestrator)
+
+Agent 4 does not create run folders — the orchestrator does. See PROJECT_CONTEXT.md §2a.
+
+- **Path:** `Agent4_Routing\output\Agent_4_{DDMMYY}_{HHMM}\`
+- **Rule:** All pipeline outputs (`Expanded_Schedule.csv`, `validation_report_agent4.txt`, freeze-day outputs, dock-scheduling outputs, etc.) go in that folder only — never `Inputs\`.
+
+When Phase 2 was accepted in the same cycle, the location file and assignment should reflect the Phase 2 `dh_fc_mh_assignment_final.csv` and `plan_volume_updated.csv` from the Agent 3 Phase 2 subfolder.
+
+---
+
 ## 7. Output Files Reference
 
-All files written to `out_dir` by `run_agent4_pipeline`. Retrieved via `result["data"]["output_files"][key]` for the file path, or directly as a DataFrame via `result["data"]["<df_key>"]` (e.g. `result["data"]["final_assignment_df"]`). The DataFrames in the return dict are identical to what is written to disk — no need to re-read files from disk after the pipeline returns.
+Primary outputs from **`run_agent4_freeze_day_pipeline`** + **`run_dock_scheduling_for_all_mhs`** (written to `out_dir`):
 
-| Filename | Logical key | Grain | Key columns | Downstream consumer | Notes |
-|---|---|---|---|---|---|
-| `Clustering_Output.csv` | `clustering` | One row per DH per MH | `MH`, `location_name`, `bearing_group`, `final_group`, `bearing`, `demand`, `ML`, `freq_allowed`, `allowed_positions` | Debugging; not consumed by other agents | Shows how DHs were grouped into bearing clusters before permutation generation |
-| `Filtered_Routes.csv` | `filtered_routes` | One row per feasible route per MH | `MH`, `route_sequence`, `hubs`, `dist`, `group`, `monthly_cost`, `Freq`, `total_demand`, `assigned_vehicle_length`, `local_or_zonal` | Debugging; not consumed by other agents | All routes that survived time-window and distance filters, after domination pruning. Input candidate set for ILP. |
-| `Final_Assignment.csv` | `final_assignment` | One row per assigned route per MH (milkrun + FTL) | `MH`, `Route_ID`, `route_sequence`, `hubs`, `dist`, `monthly_cost`, `Freq`, `Route_Type`, `assigned_vehicle_length`, `arrival_times`, `departure_times` | Phase 2 reads `total_monthly_cost` via `Agent4MHResult`; operations team reads this file for truck planning | Primary operational output. Contains ILP-selected milkrun routes and dedicated FTL trucks. `Route_Type` = `Milkrun` or `FTL_Dedicated`. |
-| `Expanded_Schedule.csv` | `expanded_schedule` | One row per stop per route per MH | `MH`, `Route_ID`, `Location`, `Arrival_Time`, `Departure_Time`, `Freq`, `Vehicle_Length`, `Total_Demand`, `Route_Sequence`, `Route_Type` | Operations team; accruals team | **Primary operational output.** Stop-level schedule. Arrival_Time/Departure_Time in minutes from midnight. First stop (depot) has no Arrival_Time (NaN). Last stop (depot return) has no Departure_Time (NaN). |
-| `osrm_fallback_log.csv` | `osrm_fallback` | One row per OSRM call | `origin`, `destination`, `distance_km`, `transit_minutes` | Debugging; data team to back-fill distance matrix | Populated only when OSRM is reachable (requires internet). Empty in offline runs. Pairs here should be added to the distance matrix to avoid future OSRM dependency. |
-| `DH_Route_Summary.csv` | `dh_summary` | One row per DH per MH | `MH`, `DH`, `original_demand`, `ML`, `ml_capacity`, `n_ftl_trucks`, `residual_cft`, `residual_absorbed`, `milkrun_demand_cft`, `route_type`, `in_milkrun_assignment` | Accruals team; operations team | Per-DH summary of how demand was handled. `route_type` = `Milkrun`, `FTL_Dedicated`, or `FTL+Milkrun`. |
-| `Absorbed_Residuals.csv` | `absorbed_residuals` | One row per DH whose milkrun residual was absorbed | `MH`, `DH`, `original_demand`, `ML`, `ml_capacity`, `n_ftl_trucks`, `residual_cft`, `residual_threshold` | Accruals team | DHs where residual after FTL allocation fell below `residual_threshold` and was absorbed entirely into FTL, removing the DH from milkrun. |
-| `validation_report_agent4.txt` | `validation_report` | Text; one section per MH | N/A | Debugging; operations review | Full run log including per-MH step output, total cost, FTL summary, 40 ft vehicle note, threshold override note if applicable. Written as UTF-8. |
-
----
-
-## 7a. Freeze-Day Engine Output Files (`agent4_freeze_day.py`)
-
-A separate, additive engine sitting alongside the legacy `run_agent4_pipeline` above — see module docstring for the day-simulation model. `run_agent4_freeze_day_pipeline(location_df, ...)` writes to its own `out_dir`:
-
-| Filename | Grain | Notes |
+| Filename | Source step | Notes |
 |---|---|---|
-| `Location_File.csv` | One row per DH | **The exact location file used for this run** — base assignment columns + `D<n>`/`D<n>_cft` (day-wise demand, real window + 7 synthetic extreme days) + `Current_MR`/`Current_Freq` (H2H baseline) + `allowed_positions`/`Freq_Allowed`. |
-| `Freeze_Day_Comparison.csv` | One row per (MH, candidate freeze day) | Committed/adhoc/total cost and adhoc% for every day tested, real and synthetic. |
-| `Final_Assignment.csv` | One row per route per MH | The optimal frozen route plan (milkrun + dedicated), after the truck-upgrade loop. |
-| `Expanded_Schedule.csv` | One row per stop per route | Stop-level detail for the optimal plan. |
-| `Baseline.csv` | One row per current route per MH | Current (H2H `Current_MR`/`Current_Freq`) route network, costed for comparison. |
-| `Baseline_vs_Optimal.csv` | One row per MH | Current vs. optimal cost/savings summary. |
-| `Network_Summary.csv` | One row per MH | Optimal freeze day, adhoc%, committed/adhoc/total cost, savings vs. baseline. |
-
-**Standing rule — Location_File.csv always lives in the run's own output folder.** `run_agent4_freeze_day_pipeline` writes it to `out_dir` automatically, alongside the other outputs — never to `Inputs\` or any shared/reused path. Each run gets its own output folder already; the location file is scoped to that folder so it's always traceable to the exact run it was used for, and never silently reused stale across runs.
+| `Location_File.csv` | Freeze-day | Exact location file used for this run |
+| `Freeze_Day_Comparison.csv` | Freeze-day | Per-MH, per-candidate-day cost comparison |
+| `Final_Assignment.csv` | Freeze-day | Optimal frozen route plan |
+| `Expanded_Schedule.csv` | Freeze-day | Stop-level schedule for optimal plan |
+| `Baseline.csv` | Freeze-day | Current H2H network, costed |
+| `Baseline_vs_Optimal.csv` | Freeze-day | Per-MH savings summary |
+| `Network_Summary.csv` | Freeze-day | Optimal freeze day, adhoc%, committed/adhoc/total |
+| `Per_Day_Route_Log.csv` | Freeze-day | Per-candidate route log |
+| `All_Days_Spillover.csv` | Freeze-day | Spillover detail across all simulated days |
+| `Route_Visualizer.html` | Freeze-day | Interactive map (call `write_route_visualizer`) |
+| `Dock_Schedule.csv` | Dock scheduling | Per-route TMS + placement time |
+| `Route_Speed.csv` | Dock scheduling | Per-route CX cutoff, capture fraction, speed% |
+| `DH_Speed.csv` | Dock scheduling | Per-DH arrival, D1% pass/fail, weighted contribution |
+| `Speed_Summary.csv` | Dock scheduling | Per-MH weighted Actual D1%/speed% |
+| `Dock_Utilization.html` | Dock scheduling | Gantt timeline — auto-written by `run_dock_scheduling_for_all_mhs` |
 
 ---
 
-## 7b. Dock Scheduling + CX-Cutoff + Speed Engine (`agent4_dock_scheduling.py`)
+## 7a. Freeze-Day Engine (`agent4_freeze_day.py`) — Main Pipeline
 
-A third additive module (alongside `agent4.py` and `agent4_freeze_day.py`), run as a **separate post-processing step after** `run_agent4_freeze_day_pipeline` — same pattern as `write_route_visualizer` (not called from inside the pipeline, to avoid a circular import: this module imports `agent4_freeze_day` for `_compute_shifted_mh_dep`/`_attr_from_dh_rows`).
+`run_agent4_freeze_day_pipeline(location_df, ...)` is the orchestrator entry point when the user says "run Agent 4". See §2 for the full call sequence.
+
+**Standing rule — `Location_File.csv` always lives in the run's own output folder** — never `Inputs\` or a shared path.
+
+---
+
+## 7b. Dock Scheduling (`agent4_dock_scheduling.py`) — Mandatory Post-Step
+
+**Always call `run_dock_scheduling_for_all_mhs` immediately after `run_agent4_freeze_day_pipeline`** unless the user explicitly says to skip dock scheduling. This is part of Agent 4, not an optional add-on.
 
 **What it does:** for the optimal freeze-day candidate's route plan (never all 37 candidates — dock scheduling only changes departure timing, never cost, so it can't affect which day is optimal), decides each route's *actual* dock-feasible departure time (TMS) given a limited number of physical docks per MH, and computes a genuine "Actual D1%"/speed metric — distinct from Agent 3's predictive D1% (which assumes direct MH-DH transit with no route/dock constraints and covers shipments still in transit to the MH; this one measures what actually happens given real routes and real dock contention).
 

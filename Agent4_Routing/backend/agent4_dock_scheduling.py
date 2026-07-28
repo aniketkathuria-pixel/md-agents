@@ -56,9 +56,19 @@ PLAYBOOK.md for the full write-up:
        are now reduced circularly (`_circular_windows`) against one fixed
        daily grid, so a window straddling midnight is correctly checked
        against whatever sits right after it.
+
+3. D1% and speed scoring (2026-07-28) use an absolute timeline from order-day
+   (Day 0) midnight through the D1 SLA (default 1800 min = 6 AM Day 1). TMS
+   stays on the recurring 0-1440 clock for scheduling/display; arrivals and
+   dock ILP occupancy map morning departures (clock < 6 AM) to Day 1 via
+   +1440. Load-profile capture plateaus at hour 24 once CX cutoff slips past
+   midnight (Day-0 orders only until Agent 1 supplies Day-1 load).
 """
 from __future__ import annotations
 
+import math
+from collections import defaultdict
+from datetime import datetime
 from typing import Any, Optional
 
 import pandas as pd
@@ -101,28 +111,451 @@ def _route_stop_offsets(
     return offsets
 
 
+def _format_minutes_ampm(minutes: float | None) -> str:
+    """Minutes from midnight -> 'H:MM AM/PM' (12-hour clock). Blank for missing."""
+    if minutes is None or (isinstance(minutes, float) and math.isnan(minutes)):
+        return ""
+    m = int(round(float(minutes))) % int(_DAY_MIN)
+    h24, minute = divmod(m, 60)
+    h12 = h24 % 12 or 12
+    ampm = "AM" if h24 < 12 else "PM"
+    return f"{h12}:{minute:02d} {ampm}"
+
+
+def _simulate_route_stop_times(
+    route_sequence: str,
+    tms: float,
+    mh_name: str,
+    attr: dict[str, dict[str, Any]],
+    dist_dict: dict[tuple[str, str], float],
+    latlong: dict[str, tuple[float, float]],
+    service_time_min: float,
+) -> list[tuple[float | None, float | None]]:
+    """Stop-level (arrival_min, departure_min) anchored on dock-chosen TMS.
+
+    Mirrors agent4.py Steps 6-9 expanded-schedule logic, but uses the actual
+    TMS from dock scheduling instead of recomputing base_dep + shift."""
+    stops = [s.strip() for s in route_sequence.split("->")]
+    if not stops:
+        return []
+
+    out: list[tuple[float | None, float | None]] = [(None, tms)]
+    cur_t = tms
+    prev = stops[0]
+    for i in range(1, len(stops)):
+        d = stops[i]
+        km = a4.get_distance(prev, d, dist_dict, latlong)
+        km = km if km is not None else 0.0
+        arr = cur_t + a4.get_transit_time(km)
+        if d != mh_name:
+            tw_start = attr.get(d, {}).get("time_window_start", 720.0)
+            dep = max(arr, tw_start) + service_time_min
+            out.append((arr, dep))
+            cur_t = dep
+        else:
+            out.append((arr, None))
+        prev = d
+    return out
+
+
+def enrich_expanded_schedule_with_times(
+    expanded_schedule_df: pd.DataFrame,
+    route_speed_df: pd.DataFrame,
+    location_df: pd.DataFrame,
+    dist_dict: dict[tuple[str, str], float],
+    latlong: dict[str, tuple[float, float]],
+    mh_configs: dict[str, "a4.MHConfig"],
+    cfg: dict[str, Any],
+) -> pd.DataFrame:
+    """Append Arrival_Time / Departure_Time to Expanded_Schedule rows.
+
+    Joins each route to Route_Speed.TMS and simulates per-leg times (agent4.py
+    style). Times are written as 'H:MM AM/PM' strings."""
+    if expanded_schedule_df.empty:
+        return expanded_schedule_df
+
+    mh_col = cfg["col_mh_assignment"]
+    tms_map = {
+        (str(mh), int(rid)): float(tms)
+        for mh, rid, tms in zip(
+            route_speed_df["MH"].astype(str),
+            route_speed_df["Route_ID"].astype(int),
+            route_speed_df["TMS"].astype(float),
+        )
+    }
+
+    df = expanded_schedule_df.copy()
+    df["Arrival_Time"] = ""
+    df["Departure_Time"] = ""
+
+    attr_cache: dict[str, dict[str, dict[str, Any]]] = {}
+    service_cache: dict[str, float] = {}
+
+    for (mh, rid), group in df.groupby(["MH", "Route_ID"], sort=False):
+        mh_s = str(mh)
+        rid_i = int(rid)
+        tms = tms_map.get((mh_s, rid_i))
+        route_seq = str(group.iloc[0].get("Route_Sequence", "") or "")
+        if tms is None or not route_seq:
+            continue
+
+        if mh_s not in attr_cache:
+            dh_rows = location_df[location_df[mh_col].astype(str) == mh_s]
+            attr_cache[mh_s] = fd._attr_from_dh_rows(dh_rows, cfg)
+        if mh_s not in service_cache:
+            mh_cfg = mh_configs.get(mh_s)
+            service_cache[mh_s] = (
+                mh_cfg.service_time_min if mh_cfg is not None
+                else float(cfg.get("default_service_time_min", 30))
+            )
+
+        stop_times = _simulate_route_stop_times(
+            route_seq, tms, mh_s, attr_cache[mh_s], dist_dict, latlong, service_cache[mh_s],
+        )
+        for i, df_idx in enumerate(group.index):
+            arr_m, dep_m = stop_times[i] if i < len(stop_times) else (None, None)
+            df.at[df_idx, "Arrival_Time"] = _format_minutes_ampm(arr_m)
+            df.at[df_idx, "Departure_Time"] = _format_minutes_ampm(dep_m)
+
+    return df
+
+
 _DAY_MIN = 1440.0   # one repeating operational day, in minutes
+_BASELINE_TMS_INCONSISTENT_MIN = 30.0   # flag MR groups whose hub TMS values spread wider than this
+
+
+def _d1_morning_clock_cutoff(cfg: dict[str, Any]) -> float:
+    """Clock times below this (default 6:00 AM) are calendar Day 1 of the order cycle."""
+    return float(cfg.get("d1_true_threshold_min", 1800)) % _DAY_MIN
+
+
+def _d1_deadline_abs(cfg: dict[str, Any]) -> float:
+    """6:00 AM Day 1 = 1800 min from Day 0 midnight."""
+    return float(cfg.get("d1_true_threshold_min", 1800))
+
+
+def _clock_to_absolute(t_clock: float, cfg: dict[str, Any]) -> float:
+    """Map recurring clock TMS to minutes from order-day (Day 0) midnight.
+
+    Day 0 evening departures keep clock value; post-midnight morning departures
+  (delivery run day) add one full day (1440)."""
+    t = float(t_clock) % _DAY_MIN
+    if t < _d1_morning_clock_cutoff(cfg):
+        return _DAY_MIN + t
+    return t
+
+
+def _cx_buffer_hours(is_multi_dh: bool, cfg: dict[str, Any]) -> float:
+    return (
+        cfg.get("cx_cutoff_multi_dh_hours", 3) if is_multi_dh else cfg.get("cx_cutoff_single_dh_hours", 2)
+    ) + cfg.get("cx_cutoff_processing_hours", 1)
+
+
+def _cx_cutoff_abs(tms_clock: float, is_multi_dh: bool, cfg: dict[str, Any]) -> float:
+    return _clock_to_absolute(tms_clock, cfg) - _cx_buffer_hours(is_multi_dh, cfg) * 60.0
+
+
+def _cx_cutoff_order_day_hour(tms_clock: float, is_multi_dh: bool, cfg: dict[str, Any]) -> float:
+    """Hour on order Day 0 for Load Profile lookup (0-24). Day 1+ cutoff -> 24h plateau."""
+    cutoff_abs = _cx_cutoff_abs(tms_clock, is_multi_dh, cfg)
+    if cutoff_abs >= _DAY_MIN:
+        return 24.0
+    if cutoff_abs < 0:
+        return 0.0
+    return cutoff_abs / 60.0
+
+
+def _capture_fraction_from_tms(
+    tms_clock: float, is_multi_dh: bool, cfg: dict[str, Any], load_profile_interp,
+) -> float:
+    """Day-0 orders only: plateau at hour 24 once cutoff slips past midnight."""
+    return float(load_profile_interp(_cx_cutoff_order_day_hour(tms_clock, is_multi_dh, cfg)))
+
+
+def _arrival_abs(tms_clock: float, offset_min: float, cfg: dict[str, Any]) -> float:
+    return _clock_to_absolute(tms_clock, cfg) + offset_min
+
+
+def _dock_horizon_min(cfg: dict[str, Any], transition_buffer: float) -> float:
+    return float(cfg.get("dock_d1_horizon_min", _d1_deadline_abs(cfg))) + transition_buffer
+
+
+def _dock_window_abs(
+    tms_clock: float, duration: float, transition_buffer: float, cfg: dict[str, Any],
+) -> tuple[float, float]:
+    tms_abs = _clock_to_absolute(tms_clock, cfg)
+    return tms_abs - duration, tms_abs + transition_buffer
+
+
+def _window_covers_tau(window_start: float, window_end: float, tau: float) -> bool:
+    return window_start <= tau < window_end
+
+
+def _parse_tms_clock_to_minutes(raw: Any) -> float | None:
+    """H2H TMS strings ('5:40:00 PM', '12:10:00 AM') -> minutes from midnight."""
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        return None
+    s = str(raw).strip()
+    if not s or s.lower() in ("", "nan", "none"):
+        return None
+    for fmt in ("%I:%M:%S %p", "%I:%M %p", "%H:%M:%S", "%H:%M"):
+        try:
+            t = datetime.strptime(s, fmt)
+            return t.hour * 60.0 + t.minute + t.second / 60.0
+        except ValueError:
+            continue
+    return None
+
+
+def build_h2h_tms_lookups(
+    h2h_df: pd.DataFrame,
+    cfg: dict[str, Any],
+) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], float], list[dict[str, Any]]]:
+    """(dh_tms, mr_tms, issues) keyed by (MH, DH) and (MH, MR Number).
+
+  Duplicate rows for the same DH keep the latest TMS (max minutes) -- later
+  departure captures more volume. MR-level TMS is the max across all hubs in
+  that MR; spread > 30 min within an MR logs baseline_tms_inconsistent."""
+    src_col = cfg.get("col_h2h_src", "Src")
+    dh_col = cfg.get("col_h2h_dh_key", "Dest")
+    mr_col = cfg.get("col_h2h_mr_number", "MR Number")
+    tms_col = cfg.get("col_h2h_tms", "TMS")
+
+    dh_candidates: dict[tuple[str, str], list[float]] = defaultdict(list)
+    mr_candidates: dict[tuple[str, str], list[float]] = defaultdict(list)
+    issues: list[dict[str, Any]] = []
+
+    for _, row in h2h_df.iterrows():
+        tms = _parse_tms_clock_to_minutes(row.get(tms_col))
+        if tms is None:
+            continue
+        mh = str(row[src_col]).strip()
+        dh = str(row[dh_col]).strip().upper()
+        mr = str(row[mr_col]).strip()
+        dh_candidates[(mh, dh)].append(tms)
+        if mr.lower() not in ("", "nan", "none", "direct"):
+            mr_candidates[(mh, mr)].append(tms)
+
+    dh_tms = {k: max(v) % _DAY_MIN for k, v in dh_candidates.items()}
+    mr_tms: dict[tuple[str, str], float] = {}
+    for key, vals in mr_candidates.items():
+        mr_tms[key] = max(vals) % _DAY_MIN
+        spread = max(vals) - min(vals)
+        if spread > _BASELINE_TMS_INCONSISTENT_MIN:
+            issues.append({
+                "type": "baseline_tms_inconsistent",
+                "detail": f"{key[0]} / MR '{key[1]}': TMS spread {spread:.0f} min across hubs "
+                          f"(>{_BASELINE_TMS_INCONSISTENT_MIN:.0f} min threshold); using latest TMS.",
+            })
+    return dh_tms, mr_tms, issues
+
+
+def _baseline_route_type(route: dict[str, Any]) -> str:
+    if route.get("route_type") == "Dedicated" and len(route.get("hubs", [])) == 1:
+        return "FTL_Dedicated"
+    return "Milkrun"
+
+
+def _resolve_baseline_route_tms(
+    mh_name: str,
+    route: dict[str, Any],
+    route_groups: list[dict[str, Any]],
+    dh_tms: dict[tuple[str, str], float],
+    mr_tms: dict[tuple[str, str], float],
+    attr: dict[str, dict[str, Any]],
+    dist_dict: dict[tuple[str, str], float],
+    latlong: dict[str, tuple[float, float]],
+    service_time_min: float,
+    issues: list[dict[str, Any]],
+) -> float:
+    hubs = list(route.get("hubs", []))
+    hub_set = set(hubs)
+    for grp in route_groups:
+        if grp.get("is_direct"):
+            continue
+        if hub_set.issubset(set(grp.get("dhs", []))):
+            tms = mr_tms.get((mh_name, grp["group_id"]))
+            if tms is not None:
+                return tms
+            break
+    if len(hubs) == 1:
+        tms = dh_tms.get((mh_name, str(hubs[0]).strip().upper()))
+        if tms is not None:
+            return tms
+    fallback = fd._compute_shifted_mh_dep(
+        route["route_sequence"], attr, dist_dict, latlong, service_time_min,
+    ) % _DAY_MIN
+    issues.append({
+        "type": "baseline_tms_missing",
+        "detail": f"{mh_name}: no H2H TMS for route {route.get('route_sequence')}; "
+                  f"using computed ideal departure ({fallback:.1f} min).",
+    })
+    return fallback
+
+
+def _compute_speed_metrics_at_tms(
+    routes: list[dict[str, Any]],
+    tms_by_idx: dict[int, float],
+    mh_name: str,
+    dh_rows: pd.DataFrame,
+    mh_cfg: "a4.MHConfig",
+    dist_dict: dict[tuple[str, str], float],
+    latlong: dict[str, tuple[float, float]],
+    load_profile_interp,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Weighted Top266 speed% for fixed per-route TMS values (no dock ILP)."""
+    loc_col = cfg["col_location_name"]
+    attr = fd._attr_from_dh_rows(dh_rows, cfg)
+    top266_map = dict(zip(dh_rows[loc_col].astype(str), dh_rows[cfg["col_top266_load"]]))
+    d1_true_map = dict(zip(dh_rows[loc_col].astype(str), dh_rows["d1_true_threshold"]))
+
+    dh_to_mr_idx: dict[str, int] = {}
+    for idx, route in enumerate(routes):
+        if _baseline_route_type(route) == "Milkrun":
+            for dh in route.get("hubs", []):
+                dh_to_mr_idx[dh] = idx
+
+    dh_speed_rows: list[dict[str, Any]] = []
+    route_speed_rows: list[dict[str, Any]] = []
+    mh_weighted_num = mh_weighted_den = 0.0
+
+    for idx, route in enumerate(routes):
+        hubs = list(route.get("hubs", []))
+        route_type = _baseline_route_type(route)
+        is_ftl = route_type == "FTL_Dedicated"
+        if is_ftl and len(hubs) == 1 and hubs[0] in dh_to_mr_idx:
+            continue
+
+        tms = tms_by_idx[idx]
+        is_multi = len(hubs) > 1
+        offsets = _route_stop_offsets(
+            route["route_sequence"], attr, dist_dict, latlong, mh_cfg.service_time_min,
+        )
+        is_multi = len(hubs) > 1
+        capture_fraction = _capture_fraction_from_tms(tms, is_multi, cfg, load_profile_interp)
+        route_top266_total = sum(top266_map.get(dh, 0.0) for dh in hubs)
+        route_speed_value = 0.0
+        d1_deadline = _d1_deadline_abs(cfg)
+
+        for dh in hubs:
+            arrival = _arrival_abs(tms, offsets.get(dh, 0.0), cfg)
+            threshold = d1_true_map.get(dh, d1_deadline)
+            passed = arrival <= threshold
+            top266 = top266_map.get(dh, 0.0)
+            contrib = top266 * (capture_fraction if passed else 0.0)
+            route_speed_value += contrib
+            dh_speed_rows.append({
+                "MH": mh_name,
+                "destination_hub_key": dh,
+                "Route_ID": idx + 1,
+                "TMS": round(tms, 2),
+                "Arrival_Time": round(arrival, 2),
+                "D1_True_Threshold": threshold,
+                "D1_Achieved": passed,
+                "Top266_Shipments": top266,
+                "Capture_Fraction": round(capture_fraction, 3) if passed else 0.0,
+                "Speed_Contribution": round(contrib, 4),
+            })
+            mh_weighted_num += contrib
+            mh_weighted_den += top266
+
+        route_speed_rows.append({
+            "MH": mh_name,
+            "Route_ID": idx + 1,
+            "TMS": round(tms, 2),
+            "CX_Cutoff_Hour": round(_cx_cutoff_order_day_hour(tms, is_multi, cfg), 2),
+            "Capture_Fraction": round(capture_fraction, 3),
+            "Top266_Total": route_top266_total,
+            "Top266_Speed_Value": round(route_speed_value, 2),
+            "Route_Speed_Pct": round(route_speed_value / route_top266_total * 100, 1) if route_top266_total else None,
+        })
+
+    mh_speed_pct = round(mh_weighted_num / mh_weighted_den * 100, 1) if mh_weighted_den else None
+    return {
+        "dh_speed_df": pd.DataFrame(dh_speed_rows),
+        "route_speed_df": pd.DataFrame(route_speed_rows),
+        "mh_speed_pct": mh_speed_pct,
+    }
+
+
+def compute_baseline_speed_for_mh(
+    baseline: dict[str, Any],
+    dh_rows: pd.DataFrame,
+    mh_name: str,
+    mh_cfg: "a4.MHConfig",
+    dist_dict: dict[tuple[str, str], float],
+    latlong: dict[str, tuple[float, float]],
+    load_profile_interp,
+    cfg: dict[str, Any],
+    dh_tms: dict[tuple[str, str], float],
+    mr_tms: dict[tuple[str, str], float],
+) -> dict[str, Any]:
+    """Baseline (current H2H) speed% using actual TMS -- no dock ILP."""
+    issues: list[dict[str, Any]] = []
+    routes = list(baseline.get("ded_routes", [])) + list(baseline.get("mr_routes", []))
+    if not routes:
+        return {
+            "status": "ok",
+            "issues": issues,
+            "data": {"dh_speed_df": pd.DataFrame(), "route_speed_df": pd.DataFrame(), "mh_speed_pct": None},
+        }
+
+    attr = fd._attr_from_dh_rows(dh_rows, cfg)
+    route_groups = baseline.get("route_groups", [])
+    tms_by_idx: dict[int, float] = {}
+    for idx, route in enumerate(routes):
+        tms_by_idx[idx] = _resolve_baseline_route_tms(
+            mh_name, route, route_groups, dh_tms, mr_tms, attr,
+            dist_dict, latlong, mh_cfg.service_time_min, issues,
+        )
+
+    metrics = _compute_speed_metrics_at_tms(
+        routes, tms_by_idx, mh_name, dh_rows, mh_cfg,
+        dist_dict, latlong, load_profile_interp, cfg,
+    )
+    return {"status": "ok", "issues": issues, "data": metrics}
+
+
+def _merge_baseline_into_dh_speed(
+    dh_speed_df: pd.DataFrame,
+    baseline_dh_by_mh: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Add baseline speed columns onto proposal DH_Speed rows."""
+    if dh_speed_df.empty:
+        return dh_speed_df
+
+    out = dh_speed_df.copy()
+    for col in (
+        "Baseline_TMS", "Baseline_Arrival_Time", "Baseline_Capture_Fraction",
+        "Baseline_D1_Achieved", "Speed_Delta_Contribution",
+    ):
+        out[col] = None
+
+    for idx, row in out.iterrows():
+        mh = str(row["MH"])
+        dh = str(row["destination_hub_key"])
+        bdf = baseline_dh_by_mh.get(mh)
+        if bdf is None or bdf.empty:
+            continue
+        match = bdf[bdf["destination_hub_key"].astype(str) == dh]
+        if match.empty:
+            continue
+        b = match.iloc[0]
+        out.at[idx, "Baseline_TMS"] = b["TMS"]
+        out.at[idx, "Baseline_Arrival_Time"] = b["Arrival_Time"]
+        out.at[idx, "Baseline_Capture_Fraction"] = b["Capture_Fraction"]
+        out.at[idx, "Baseline_D1_Achieved"] = b["D1_Achieved"]
+        opt_contrib = float(row["Top266_Shipments"]) * float(row["Capture_Fraction"])
+        base_contrib = float(b["Speed_Contribution"])
+        out.at[idx, "Speed_Delta_Contribution"] = round(opt_contrib - base_contrib, 4)
+
+    return out
 
 
 def _cx_cutoff_hour(t_minutes: float, is_multi_dh: bool, cfg: dict[str, Any]) -> float:
-    """CX cutoff = TMS - (3h multi-DH / 2h single-DH) - 1h processing, reduced
-    to an hour-of-day (0-24) for the load-profile lookup.
-
-    t_minutes is always a genuine daily-clock value in [0, _DAY_MIN) now (see
-    schedule_docks_and_compute_speed) -- the truck leaves at the SAME clock
-    time every single day, forever, so there is no "which calendar day"
-    ambiguity to special-case anymore. A cutoff that lands before midnight
-    (e.g. a truck leaving at 00:30 with a 4h buffer -> cutoff -3:30) simply
-    falls on the previous evening; Load Profile.csv is itself one repeating
-    daily curve, so a plain modulo is the correct, exact reduction here, not
-    an approximation -- the old clamp-at-both-ends logic was a symptom of
-    treating time as an unbounded line instead of a repeating cycle (see
-    PLAYBOOK.md's "daily-cycle dock scheduling" entry)."""
-    buffer_hours = (
-        cfg.get("cx_cutoff_multi_dh_hours", 3) if is_multi_dh else cfg.get("cx_cutoff_single_dh_hours", 2)
-    ) + cfg.get("cx_cutoff_processing_hours", 1)
-    cutoff_minutes = (t_minutes - buffer_hours * 60.0) % _DAY_MIN
-    return cutoff_minutes / 60.0
+    """Order-day hour for Load Profile (legacy name). See _cx_cutoff_order_day_hour."""
+    return _cx_cutoff_order_day_hour(t_minutes, is_multi_dh, cfg)
 
 
 def _circular_windows(start: float, end: float, period: float = _DAY_MIN) -> list[tuple[float, float]]:
@@ -269,16 +702,17 @@ def schedule_docks_and_compute_speed(
         })
 
     # Precompute speed_value[t] per route/candidate -- weighted Top266
-    # shipments captured AND delivered by the true D1% threshold.
+    # shipments captured AND delivered by the true D1% threshold (absolute
+    # minutes from order-day midnight; 6 AM Day 1 = 1800).
+    d1_deadline = _d1_deadline_abs(cfg)
     for r in route_info:
         r["speed_value"] = {}
         for t in r["candidates"]:
-            cutoff_hour = _cx_cutoff_hour(t, r["is_multi"], cfg)
-            capture_fraction = load_profile_interp(cutoff_hour)
+            capture_fraction = _capture_fraction_from_tms(t, r["is_multi"], cfg, load_profile_interp)
             val = 0.0
             for dh in r["hubs"]:
-                arrival = t + r["offsets"].get(dh, 0.0)
-                if arrival <= d1_true_map.get(dh, cfg["d1_true_threshold_min"]):
+                arrival = _arrival_abs(t, r["offsets"].get(dh, 0.0), cfg)
+                if arrival <= d1_true_map.get(dh, d1_deadline):
                     val += top266_map.get(dh, 0.0) * capture_fraction
             r["speed_value"][t] = val
 
@@ -308,38 +742,28 @@ def schedule_docks_and_compute_speed(
     for r in route_info:
         prob += lpSum(x[(r["idx"], t)] for t in r["candidates"]) == 1
 
-    # Dock capacity: at every grid point (one fixed daily cycle, [0, 1440)),
-    # at most n_docks_committed occupancy windows may be active. Windows are
-    # reduced circularly (_circular_windows) so a window straddling midnight
-    # is correctly seen as adjacent to whatever sits right after it, instead
-    # of being invisible to a route on the "other side" of midnight (Issue 2).
-    # Linked FTL routes contribute their OWN occupancy window at their
-    # anchor Milkrun route's chosen time -- reusing that same x variable
-    # (never a new one), so choosing a time for the Milkrun route correctly
-    # consumes 2 physical docks at once if both windows overlap a grid point.
+    # Dock capacity on a linear absolute timeline (order day 0 through D1 SLA).
+    # TMS stays on the recurring clock for scheduling; occupancy windows are
+    # mapped to absolute minutes so a 23:50 Day-0 and 00:30 Day-1 departure
+    # are ~40 min apart, not 23h apart.
     route_by_idx = {r["idx"]: r for r in route_info}
-    n_grid = int(_DAY_MIN / granularity)
+    horizon = _dock_horizon_min(cfg, transition_buffer)
+    n_grid = int(horizon / granularity) + 1
     grid_points = [k * granularity for k in range(n_grid)]
 
     for tau in grid_points:
         covering = []
         for r in route_info:
             for t in r["candidates"]:
-                window_start = t - r["duration"]
-                window_end = t + transition_buffer
-                for a, b in _circular_windows(window_start, window_end):
-                    if a <= tau < b:
-                        covering.append(x[(r["idx"], t)])
-                        break
+                a, b = _dock_window_abs(t, r["duration"], transition_buffer, cfg)
+                if _window_covers_tau(a, b, tau):
+                    covering.append(x[(r["idx"], t)])
         for lf in linked_ftl:
             anchor = route_by_idx[lf["anchor_idx"]]
             for t in anchor["candidates"]:
-                window_start = t - lf["duration"]
-                window_end = t + transition_buffer
-                for a, b in _circular_windows(window_start, window_end):
-                    if a <= tau < b:
-                        covering.append(x[(anchor["idx"], t)])
-                        break
+                a, b = _dock_window_abs(t, lf["duration"], transition_buffer, cfg)
+                if _window_covers_tau(a, b, tau):
+                    covering.append(x[(anchor["idx"], t)])
         if covering:
             prob += lpSum(covering) <= n_docks_committed
 
@@ -370,8 +794,8 @@ def schedule_docks_and_compute_speed(
         row["Placement_Time"] = round(chosen_t - r["duration"], 2)
         schedule_rows.append(row)
 
-        cutoff_hour = _cx_cutoff_hour(chosen_t, r["is_multi"], cfg)
-        capture_fraction = load_profile_interp(cutoff_hour)
+        cutoff_hour = _cx_cutoff_order_day_hour(chosen_t, r["is_multi"], cfg)
+        capture_fraction = _capture_fraction_from_tms(chosen_t, r["is_multi"], cfg, load_profile_interp)
         route_top266_total = sum(top266_map.get(dh, 0.0) for dh in r["hubs"])
         route_speed_value = r["speed_value"][chosen_t]
         route_speed_rows.append({
@@ -384,9 +808,10 @@ def schedule_docks_and_compute_speed(
             "Synced_To_Route_ID": None,
         })
 
+        d1_deadline = _d1_deadline_abs(cfg)
         for dh in r["hubs"]:
-            arrival = chosen_t + r["offsets"].get(dh, 0.0)
-            threshold = d1_true_map.get(dh, cfg["d1_true_threshold_min"])
+            arrival = _arrival_abs(chosen_t, r["offsets"].get(dh, 0.0), cfg)
+            threshold = d1_true_map.get(dh, d1_deadline)
             passed = arrival <= threshold
             top266 = top266_map.get(dh, 0.0)
             dh_speed_rows.append({
@@ -412,8 +837,8 @@ def schedule_docks_and_compute_speed(
         row["Placement_Time"] = round(chosen_t - lf["duration"], 2)
         schedule_rows.append(row)
 
-        cutoff_hour = _cx_cutoff_hour(chosen_t, False, cfg)   # FTL dedicated = single-DH cutoff
-        capture_fraction = load_profile_interp(cutoff_hour)
+        cutoff_hour = _cx_cutoff_order_day_hour(chosen_t, False, cfg)
+        capture_fraction = _capture_fraction_from_tms(chosen_t, False, cfg, load_profile_interp)
         route_speed_rows.append({
             "MH": mh_name, "Route_ID": lf["idx"] + 1, "TMS": round(chosen_t, 2),
             "Ideal_TMS": round(chosen_t, 2),   # no independent ideal -- always synced to the anchor
@@ -981,6 +1406,7 @@ def run_dock_scheduling_for_all_mhs(
     load_profile_interp,
     cfg: dict[str, Any],
     out_dir,
+    h2h_df: Optional[pd.DataFrame] = None,
 ) -> dict[str, Any]:
     """Post-processing step, called separately after run_agent4_freeze_day_pipeline
     (same pattern as write_route_visualizer) -- avoids a circular import, since
@@ -989,8 +1415,13 @@ def run_dock_scheduling_for_all_mhs(
     per_mh_results: from run_agent4_freeze_day_pipeline's result["data"]["per_mh_results"].
     location_df: the same freeze-day location file passed to the pipeline.
     load_profile_interp: from agent3.build_load_profile_interp(load_profile_df)["data"].
+    h2h_df: H2H network file with TMS column -- used to compute baseline speed%
+        (current network actual departures). Optional; skipped when None.
 
-    Writes Dock_Schedule.csv, Route_Speed.csv, DH_Speed.csv, Speed_Summary.csv to out_dir.
+    Writes Dock_Schedule.csv, Route_Speed.csv, DH_Speed.csv, Speed_Summary.csv to
+    out_dir, appends Arrival_Time / Departure_Time to Expanded_Schedule.csv when
+    present, and adds baseline speed columns to Speed_Summary / Network_Summary /
+    DH_Speed when h2h_df is supplied.
     """
     from pathlib import Path
     out_dir = Path(out_dir)
@@ -999,6 +1430,13 @@ def run_dock_scheduling_for_all_mhs(
     mh_col = cfg["col_mh_assignment"]
     schedule_rows, route_speed_rows, dh_speed_rows, speed_summary_rows = [], [], [], []
     issues: list[dict[str, Any]] = []
+    baseline_dh_by_mh: dict[str, pd.DataFrame] = {}
+
+    dh_tms: dict[tuple[str, str], float] = {}
+    mr_tms: dict[tuple[str, str], float] = {}
+    if h2h_df is not None and not h2h_df.empty:
+        dh_tms, mr_tms, tms_issues = build_h2h_tms_lookups(h2h_df, cfg)
+        issues.extend(tms_issues)
 
     for mh_name, mh_data in per_mh_results.items():
         freeze = mh_data.get("freeze")
@@ -1023,23 +1461,64 @@ def run_dock_scheduling_for_all_mhs(
         schedule_rows.append(d["schedule_df"])
         route_speed_rows.append(d["route_speed_df"])
         dh_speed_rows.append(d["dh_speed_df"])
+
+        baseline_mh_speed_pct = None
+        speed_delta_pct = None
+        if h2h_df is not None and mh_data.get("baseline"):
+            bl = compute_baseline_speed_for_mh(
+                mh_data["baseline"], dh_rows, mh_name, mh_cfg,
+                dist_dict, latlong, load_profile_interp, cfg, dh_tms, mr_tms,
+            )
+            issues.extend(bl["issues"])
+            baseline_mh_speed_pct = bl["data"]["mh_speed_pct"]
+            baseline_dh_by_mh[mh_name] = bl["data"]["dh_speed_df"]
+            if baseline_mh_speed_pct is not None and d["mh_speed_pct"] is not None:
+                speed_delta_pct = round(d["mh_speed_pct"] - baseline_mh_speed_pct, 1)
+
         speed_summary_rows.append({
             "MH": mh_name,
             "n_docks_total": mh_cfg.n_docks,
             "n_docks_committed": d["n_docks_committed"],
             "n_routes": len(fa),
             "mh_speed_pct": d["mh_speed_pct"],
+            "baseline_mh_speed_pct": baseline_mh_speed_pct,
+            "speed_delta_pct": speed_delta_pct,
         })
 
     schedule_df = pd.concat(schedule_rows, ignore_index=True) if schedule_rows else pd.DataFrame()
     route_speed_df = pd.concat(route_speed_rows, ignore_index=True) if route_speed_rows else pd.DataFrame()
     dh_speed_df = pd.concat(dh_speed_rows, ignore_index=True) if dh_speed_rows else pd.DataFrame()
+    if baseline_dh_by_mh:
+        dh_speed_df = _merge_baseline_into_dh_speed(dh_speed_df, baseline_dh_by_mh)
     speed_summary_df = pd.DataFrame(speed_summary_rows)
 
     schedule_df.to_csv(out_dir / "Dock_Schedule.csv", index=False)
     route_speed_df.to_csv(out_dir / "Route_Speed.csv", index=False)
     dh_speed_df.to_csv(out_dir / "DH_Speed.csv", index=False)
     speed_summary_df.to_csv(out_dir / "Speed_Summary.csv", index=False)
+
+    network_summary_path = out_dir / "Network_Summary.csv"
+    if network_summary_path.exists() and not speed_summary_df.empty:
+        ns = pd.read_csv(network_summary_path)
+        speed_map = speed_summary_df.set_index("MH")
+        ns["baseline_speed_pct"] = ns["MH"].map(speed_map["baseline_mh_speed_pct"])
+        ns["optimal_speed_pct"] = ns["MH"].map(speed_map["mh_speed_pct"])
+        ns["speed_improvement_pct"] = ns["MH"].map(speed_map["speed_delta_pct"])
+        ns.to_csv(network_summary_path, index=False)
+
+    expanded_path = out_dir / "Expanded_Schedule.csv"
+    expanded_schedule_df = pd.DataFrame()
+    if expanded_path.exists() and not route_speed_df.empty:
+        expanded_schedule_df = enrich_expanded_schedule_with_times(
+            pd.read_csv(expanded_path),
+            route_speed_df,
+            location_df,
+            dist_dict,
+            latlong,
+            mh_configs,
+            cfg,
+        )
+        expanded_schedule_df.to_csv(expanded_path, index=False)
 
     # Dock_Utilization.html is a default output of this function -- always
     # generated alongside the CSVs above, not a separate manual step. Safe to
@@ -1057,8 +1536,53 @@ def run_dock_scheduling_for_all_mhs(
             "speed_summary_df": speed_summary_df,
             "dock_utilization_html": viz_result["data"]["html_path"],
             "dock_utilization_json": viz_result["data"]["dock_utilization_json"],
+            "expanded_schedule_df": expanded_schedule_df,
         },
     }
+
+
+def _dock_schedule_times_self_check() -> None:
+    """ponytail: format + stop-time simulation smoke test."""
+    assert _format_minutes_ampm(0) == "12:00 AM"
+    assert _format_minutes_ampm(24) == "12:24 AM"
+    assert _format_minutes_ampm(720) == "12:00 PM"
+    assert _format_minutes_ampm(1422) == "11:42 PM"
+    assert _format_minutes_ampm(None) == ""
+    assert _parse_tms_clock_to_minutes("5:40:00 PM") == 17 * 60 + 40
+    assert _parse_tms_clock_to_minutes("12:10:00 AM") == 10
+    assert _parse_tms_clock_to_minutes("12:00:00 PM") == 720
+
+    attr = {"DH1": {"time_window_start": 0.0}}
+    dist = {("MH", "DH1"): 60.0, ("DH1", "MH"): 60.0}
+    latlong: dict[str, tuple[float, float]] = {}
+    # 60 km @ default transit -> 120 min each leg (agent4 get_transit_time)
+    stops = _simulate_route_stop_times(
+        "MH -> DH1 -> MH", 100.0, "MH", attr, dist, latlong, service_time_min=30.0,
+    )
+    assert stops[0] == (None, 100.0)
+    assert stops[1][0] == 220.0
+    assert stops[1][1] == 250.0
+    assert stops[2][0] == 370.0 and stops[2][1] is None
+
+
+def _d1_timeline_self_check() -> None:
+    """Route 15 regression: early-morning clock must map past D1 deadline."""
+    cfg = {
+        "d1_true_threshold_min": 1800,
+        "cx_cutoff_multi_dh_hours": 3,
+        "cx_cutoff_single_dh_hours": 2,
+        "cx_cutoff_processing_hours": 1,
+    }
+    assert _clock_to_absolute(234.5, cfg) == 1674.5
+    assert _clock_to_absolute(1320.0, cfg) == 1320.0
+    assert _arrival_abs(234.5, 174.0, cfg) == 1848.5
+    assert not (1848.5 <= _d1_deadline_abs(cfg))
+    assert 1680.0 <= _d1_deadline_abs(cfg)
+    class _LP:
+        def __call__(self, h):
+            return min(1.0, h / 24.0)
+    # TMS 04:20 Day 1 (abs 1700) -> cutoff past midnight -> hour-24 plateau
+    assert _capture_fraction_from_tms(260.0, True, cfg, _LP()) == 1.0
 
 
 def _dock_viz_self_check() -> None:
@@ -1095,5 +1619,7 @@ def _dock_viz_self_check() -> None:
 
 
 if __name__ == "__main__":
+    _d1_timeline_self_check()
+    _dock_schedule_times_self_check()
     _dock_viz_self_check()
-    print("dock viz self-check ok")
+    print("dock scheduling self-checks ok")

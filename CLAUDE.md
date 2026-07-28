@@ -91,26 +91,28 @@ If you are mid-task and realise you missed a required MD — stop, read it, then
 ### Pipeline rules
 - Never run Phase 2 without explicit user approval of MH pairs
 - Never auto-append to PLAYBOOK.md — draft entry and ask user first
-- Never bypass preflight_check before run_agent4_pipeline
+- **Agent 4 = freeze-day pipeline + dock scheduling (always both).** See `AGENT4.md` §2 and `PLAYBOOK.md` orchestrator flows. Do not call `run_agent4_pipeline` as the Agent 4 run — that function is not the orchestrator entry point.
+- Never bypass preflight_check before `run_agent4_freeze_day_pipeline`
 - status="failed" → stop, surface issues, do not proceed
 - status="partial" → log issues, surface non-trivial ones before proceeding
 
 ### Checkpoints — never bypass
 - Checkpoint 1 (after Agent 3): present savings opportunities, ask which MH pairs for Phase 2
 - Checkpoint 2 (after Phase 2): present before/after comparison, ask accept/reject per pair
-- Checkpoint 3 (after build_location_file): present missing ML DHs and preflight failures, wait for fixes
+- Checkpoint 3 (after `build_freeze_day_location_file` and `preflight_check`): present missing ML DHs and preflight failures, wait for fixes
 
 ### Mandatory run-start question
 Before any Agent 1 call:
 > "Which 30-day window from the SD plan files? (Month 1: day_1–30, Month 2: day_31–60, Month 3: day_61–91, or custom)"
 
 ## Agent Files
-| Agent | Python file | MD |
+| Agent | Python file(s) | MD |
 |---|---|---|
 | Agent 1 | `Agent1_DataPrep\backend\agent1.py` | `Agent1_DataPrep\AGENT1.md` |
 | Agent 2 | No Python file | `Agent2_RatesDistances\AGENT2.md` |
 | Agent 3 | `Agent3_Clustering\backend\agent3.py` | `Agent3_Clustering\AGENT3.md` |
-| Agent 4 | `Agent4_Routing\backend\agent4.py` | `Agent4_Routing\AGENT4.md` |
+| Agent 4 | `Agent4_Routing\backend\agent4_freeze_day.py` (main pipeline) + `agent4_dock_scheduling.py` (mandatory post-step) | `Agent4_Routing\AGENT4.md` |
+| Phase 2 routing ILP | `Agent4_Routing\backend\agent4.py` — **Phase 2 only**; orchestrator does not call this for Agent 4 runs | `Agent4_Routing\AGENT4.md` §Phase 2 interface |
 
 ## Known Pre-run Blockers
 - 4 MHs missing from MHDH rate card: CENTRALHUB_LM_AJLX, IXA3X, JLRSF1, KLM1

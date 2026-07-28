@@ -265,9 +265,9 @@ build_updated_plan_volume(
 ```
 Returns `{"status": "ok"|"partial", "data": DataFrame, "issues": [...]}`.
 
-**⚠ MANDATORY — call this every time, immediately after Checkpoint 2 resolves.** Never skip it, even if the user only cares about cost/Agent 4 output for this run — `plan_volume.csv` is Agent 1's own output and an input to every *future* Agent 3 run; if it isn't rebuilt, the next run will silently re-cost every moved DH against its stale, pre-Phase-2 path. See §8b for exactly where this sits in the checkpoint flow.
+**⚠ MANDATORY — call this every time, immediately after Checkpoint 2 resolves.** Save the result as `plan_volume_updated.csv` in the Phase 2 subfolder — **never overwrite** Agent 1's `plan_volume.csv`. See §8b.
 
-Rebuilds `plan_volume.csv` rows for DHs whose serving MH (DMH) changed via an accepted Phase 2 move, so the file's own `MH1..MHn` path columns stay consistent with the network topology Phase 2 actually costed. Does **not** decide which moves are accepted — `accepted_changes` must already be the final, human-approved dict (same `{DH_key: new_MH}` shape as `agent4.build_location_file`'s `phase2_accepted_changes`). Rows for DHs not in `accepted_changes` are returned completely untouched.
+Rebuilds plan-volume rows for DHs whose serving MH (DMH) changed via an accepted Phase 2 move, so `MH1..MHn` path columns stay consistent with the topology Phase 2 costed. Input `plan_vol_df` is the **original** Agent 1 `plan_volume.csv` (read-only). Does **not** decide which moves are accepted — `accepted_changes` must already be the final, human-approved dict (same `{DH_key: new_MH}` shape as `agent4.build_location_file`'s `phase2_accepted_changes`). Rows for DHs not in `accepted_changes` are returned completely untouched.
 
 Reuses Agent 3's own cost-resolution logic exactly (`build_route_lookup`, `_resolve_smh_to_dmh`) — the rebuilt path always matches whatever cost Phase 2 already reported, rather than inventing a new number.
 
@@ -294,8 +294,8 @@ r = a3.build_updated_plan_volume(
     pathway_df=pathway_df,
 )
 if r["issues"]:
-    print("Review before trusting the rebuilt file:", r["issues"])
-save_dataframe(r["data"], agent1_out_dir / "plan_volume.csv")   # a1.save_dataframe, or plain to_csv
+    print("Review before trusting the updated file:", r["issues"])
+save_dataframe(r["data"], phase2_out_dir / "plan_volume_updated.csv")
 ```
 
 ---
@@ -404,7 +404,7 @@ r3 = a3.build_updated_plan_volume(
     accepted_changes=accepted_changes,
     pathway_df=pathway_df,
 )
-save_dataframe(r3["data"], agent1_out_dir / "plan_volume.csv")
+save_dataframe(r3["data"], phase2_out_dir / "plan_volume_updated.csv")
 ```
 
 ---
@@ -479,7 +479,18 @@ The 6 keys absent from `agent3_config.json` (`use_osrm_fallback`, `osrm_base_url
 
 ## 6. Output Files Reference
 
-All 7 files are written to the `output_dir` passed to `run_agent3`. No timestamped subdirectory is created by `agent3.py` — the caller must construct and pass the desired path.
+### Run folder convention (orchestrator)
+
+The caller creates the output path — `agent3.py` does not timestamp folders. Use PROJECT_CONTEXT.md §2a:
+
+- **Phase 1:** `Agent3_Clustering\output\Agent_3_{DDMMYY}_{HHMM}\`
+- **Phase 2:** child folder `Agent_3_phase2_{DDMMYY}_{HHMM}\` inside the Phase 1 folder that Phase 2 was run against
+
+Phase 2 is always scoped to one Agent 3 Phase 1 run folder. Do not write Phase 2 outputs to a sibling folder at the same level as Phase 1.
+
+All Phase 1 files below go in the Phase 1 folder. Phase 2 adds its own files (Excel workbooks, `plan_volume_updated.csv`, `dh_fc_mh_assignment_final.csv`) in the Phase 2 subfolder — see §8b.
+
+All 7 Phase 1 files are written to the `output_dir` passed to `run_agent3`.
 
 | Filename | Grain | Key columns | Downstream consumer | Notes |
 |---|---|---|---|---|
@@ -584,25 +595,33 @@ Always pass `Agent4_Routing\backend`. `run_phase2` inserts this path into `sys.p
 
 ---
 
-## 8b. MANDATORY — `build_updated_plan_volume` must run every time, right after Checkpoint 2
+## 8b. MANDATORY — `build_updated_plan_volume` after Checkpoint 2 accept
 
 `run_phase2` only *proposes* a pool assignment — it does not decide which pairs are actually adopted. That decision is Checkpoint 2 (PROJECT_CONTEXT.md §5): Claude presents before/after cost per pair, the user accepts or rejects **per pair**, and only then does a final, approved `{DH_key: new_MH}` dict exist.
 
-**The moment that dict exists — same moment it's already handed to `agent4.build_location_file(phase2_accepted_changes=...)` — it must *also* be handed to `build_updated_plan_volume`.** This is not optional and not conditional on what the user asked the run for. `plan_volume.csv` is Agent 1's own output and an input to every future Agent 3 Phase 1 run (via `build_route_lookup`, `compute_mhmh_cost`, etc.). If it is not rebuilt at this point:
-- The next Agent 3 run will silently cost every moved DH against its **stale, pre-Phase-2 path** — the exact same class of silent-understatement bug documented elsewhere in this codebase for ILP failures and missing-edge rate cards.
-- `plan_volume.csv` and `dh_fc_mh_assignment.csv` (the file that *does* get patched today per the existing manual-merge pattern) will disagree about the network topology for every moved DH.
+**The moment that dict exists**, before Agent 4:
 
-**Never fire this on the pool optimizer's own proposed assignment.** `run_phase2`'s `best`/`dhs_moved` per pair is a recommendation, exactly like Agent 3 Phase 1's `assigned_fc_mh` — it is not a decision until a human accepts it at Checkpoint 2. Passing an unapproved or partially-approved dict here would silently commit topology changes nobody signed off on.
+1. Call `build_updated_plan_volume(plan_vol_df, accepted_changes, pathway_df)` using the **original** `plan_volume.csv` from the Agent 1 run folder that fed this cycle (read-only — do not overwrite it).
+2. Save the result as **`plan_volume_updated.csv` in the Phase 2 subfolder** (`Agent_3_phase2_{DDMMYY}_{HHMM}\`). This is the plan volume Agent 4 and future re-runs should use when Phase 2 changes were accepted.
+3. Patch `dh_fc_mh_assignment.csv` in the Agent 3 Phase 1 run folder; also save `dh_fc_mh_assignment_final.csv` (Phase 1 or Phase 2 folder — keep both in sync).
+4. Pass `accepted_changes` to `build_location_file(phase2_accepted_changes=...)` for Agent 4.
 
-**Sequence, every time, no exceptions:**
+**Never overwrite `Agent1_DataPrep\output\...\plan_volume.csv`.** Agent 1 outputs are immutable snapshots of that prep run. Topology changes from Phase 2 live only in `plan_volume_updated.csv` under the Phase 2 folder.
+
+**Never fire `build_updated_plan_volume` on unapproved Phase 2 results.** `run_phase2`'s pool optimizer output is a recommendation until Checkpoint 2 accept.
+
+**Sequence:**
 ```
-run_phase2()  →  Checkpoint 2 (user accepts/rejects per pair)  →  build accepted_changes dict
-  →  build_updated_plan_volume(plan_vol_df, accepted_changes, pathway_df)   ← THIS STEP
-  →  save_dataframe(result["data"], .../plan_volume.csv)
-  →  (separately, existing pattern) merge accepted_changes into dh_fc_mh_assignment.csv
-  →  build_location_file(phase2_accepted_changes=accepted_changes)  →  Agent 4
+run_agent3  →  output/Agent_3_{date}_{time}/
+run_phase2  →  output/Agent_3_{date}_{time}/Agent_3_phase2_{date}_{time}/
+Checkpoint 2 accept  →  build_updated_plan_volume  →  plan_volume_updated.csv (Phase 2 folder only)
+                      →  dh_fc_mh_assignment_final.csv
+                      →  build_location_file(phase2_accepted_changes=...)  →  Agent 4
 ```
-Always review `result["issues"]` before trusting the rebuilt file — `no_pathway_match` and `mixed_stream_fbf_caveat` in particular mean a DH's FBF rows may still need a second look.
+
+Always review `result["issues"]` before trusting `plan_volume_updated.csv` — `no_pathway_match` and `mixed_stream_fbf_caveat` mean some FBF rows may need a second look.
+
+Rebuild logic (FBF P1/P2 replace, non-FBF tail patch, `Path_Status` column) is unchanged — see the function docstring in `agent3.py`. Only the **save location** changed: Phase 2 folder, not Agent 1.
 
 ---
 

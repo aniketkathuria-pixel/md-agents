@@ -19,6 +19,14 @@ Agent 1 is a composable Python tool library (`backend/agent1.py`) that transform
 
 **Note on stream naming:** "Alpha" and "FBF" are used interchangeably in Flipkart's input files. The JJA Alpha SD Plan file IS the FBF day plan. When AGENT1.md refers to "FBF day plan", it means the Alpha SD plan file.
 
+### Output folder convention (orchestrator)
+
+Agent 1 does not create run folders — the orchestrator does. See PROJECT_CONTEXT.md §2a.
+
+- **Path:** `Agent1_DataPrep\output\Agent_1_{DDMMYY}_{HHMM}\`
+- **Primary outputs:** `plan_volume.csv`, `fbf_plan_dh_aggregate.csv`, `fbf_network_pathway_wide.csv` (and optionally `dh_daywise_volume.csv` when `include_daywise=True`)
+- **Rule:** Agent 1 outputs are **immutable** after the run completes. Phase 2 topology changes are saved as `plan_volume_updated.csv` in the Agent 3 Phase 2 subfolder — never by overwriting `plan_volume.csv` here.
+
 ---
 
 ## 2. Pre-call Checklist (Claude's Job)
